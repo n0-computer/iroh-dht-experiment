@@ -9,7 +9,7 @@ use indexmap::IndexSet;
 use iroh::Endpoint;
 use iroh_base::SignatureError;
 use irpc::{
-    channel::{mpsc, none::NoSender},
+    channel::{mpsc, none::NoSender, oneshot},
     rpc_requests,
 };
 use n0_future::{BufferedStreamExt, StreamExt, stream};
@@ -161,12 +161,12 @@ mod proto {
     }
 
     impl Id {
-        fn blake3_hash(data: &[u8]) -> Self {
+        pub fn blake3_hash(data: &[u8]) -> Self {
             let hash = blake3::hash(data);
             Id(hash.into())
         }
 
-        fn node_id(id: iroh::NodeId) -> Self {
+        pub fn node_id(id: iroh::NodeId) -> Self {
             Id::from(*id.as_bytes())
         }
     }
@@ -249,7 +249,7 @@ mod proto {
 }
 
 mod routing {
-    use std::{ffi::os_str::Display, fmt};
+    use std::fmt;
 
     use arrayvec::ArrayVec;
     use serde::{Deserialize, Serialize};
@@ -279,24 +279,26 @@ mod routing {
         256 // All zeros
     }
 
-    /// Distance in Kademlia is the number of leading zero bits in XOR
-    /// Lower values = closer distance (higher leading zeros)
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    pub struct Distance(u16);
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Distance([u8; 32]);
 
     impl Distance {
         pub fn between(a: &Id, b: &Id) -> Self {
-            let xor = xor(a, b);
-            let n = BUCKET_COUNT - leading_zeros(&xor);
-            Self(n as u16)
+            Self(xor(a, b))
         }
 
-        pub const MAX: Self = Self(u16::MAX);
+        pub const MAX: Self = Self([u8::MAX; 32]);
+    }
+
+    impl fmt::Debug for Distance {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "Distance({})", self)
+        }
     }
 
     impl fmt::Display for Distance {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "{}", self.0)
+            write!(f, "{}", hex::encode(self.0))
         }
     }
 
@@ -313,7 +315,7 @@ mod routing {
     }
 
     #[derive(Debug, Clone)]
-    struct KBucket {
+    pub(crate) struct KBucket {
         nodes: ArrayVec<NodeInfo, K>,
     }
 
@@ -346,13 +348,14 @@ mod routing {
             self.nodes.retain(|n| n.id != *id);
         }
 
-        fn get_nodes(&self) -> &[NodeInfo] {
+        pub fn get_nodes(&self) -> &[NodeInfo] {
             &self.nodes
         }
     }
 
+    #[derive(Debug)]
     pub(crate) struct RoutingTable {
-        buckets: [Box<KBucket>; BUCKET_COUNT],
+        pub buckets: [Box<KBucket>; BUCKET_COUNT],
         local_id: Id,
     }
 
@@ -365,7 +368,11 @@ mod routing {
         fn bucket_index(&self, target: &Id) -> usize {
             let distance = xor(&self.local_id, target);
             let zeros = leading_zeros(&distance);
-            std::cmp::min(zeros, BUCKET_COUNT - 1)
+            if zeros >= BUCKET_COUNT {
+                0 // Same node case
+            } else {
+                BUCKET_COUNT - 1 - zeros
+            }
         }
 
         pub(crate) fn add_node(&mut self, node: NodeInfo) -> bool {
@@ -396,7 +403,7 @@ mod routing {
                 }
             }
 
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
 
             candidates
                 .into_iter()
@@ -455,7 +462,33 @@ impl MemStorage {
 pub struct ApiClient(irpc::Client<ApiProto>);
 
 impl ApiClient {
-    async fn get_immutable(&self, hash: blake3::Hash) -> irpc::Result<Option<Vec<u8>>> {
+    pub async fn nodes_seen(&self, ids: &[Id]) -> irpc::Result<()> {
+        let last_seen = now();
+        let info = ids
+            .iter()
+            .map(|id| NodeInfo { id: *id, last_seen })
+            .collect();
+        self.0.notify(NodesSeen { info }).await
+    }
+
+    pub async fn get_storage_stats(&self) -> irpc::Result<BTreeMap<Id, BTreeMap<Kind, usize>>> {
+        self.0.rpc(GetStorageStats).await
+    }
+
+    pub async fn get_routing_table(&self) -> irpc::Result<Vec<Vec<NodeInfo>>> {
+        self.0.rpc(GetRoutingTable).await
+    }
+
+    pub async fn lookup(
+        &self,
+        id: Id,
+        seed: Option<NonZeroU64>,
+        n: Option<NonZeroU64>,
+    ) -> irpc::Result<irpc::channel::mpsc::Receiver<Id>> {
+        self.0.server_streaming(Lookup { id, seed, n }, 32).await
+    }
+
+    pub async fn get_immutable(&self, hash: blake3::Hash) -> irpc::Result<Option<Vec<u8>>> {
         let id = Id::from(*hash.as_bytes());
         let mut rx = self
             .0
@@ -491,7 +524,7 @@ impl ApiClient {
         }
     }
 
-    async fn put_immutable(&self, value: &[u8]) -> irpc::Result<(blake3::Hash, Vec<Id>)> {
+    pub async fn put_immutable(&self, value: &[u8]) -> irpc::Result<(blake3::Hash, Vec<Id>)> {
         let hash = blake3::hash(value);
         let id = Id::from(*hash.as_bytes());
         let mut rx = self
@@ -608,7 +641,13 @@ struct PutProgressItem {
 #[derive(Debug, Serialize, Deserialize)]
 enum ApiProto {
     #[rpc(wrap, tx = NoSender)]
-    NodeSeen { info: NodeInfo },
+    NodesSeen { info: Vec<NodeInfo> },
+    #[rpc(wrap, tx = mpsc::Sender<Id>)]
+    Lookup {
+        id: Id,
+        seed: Option<NonZeroU64>,
+        n: Option<NonZeroU64>,
+    },
     #[rpc(wrap, tx = mpsc::Sender<Id>)]
     NetworkPut { id: Id, value: Value },
     #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
@@ -618,6 +657,12 @@ enum ApiProto {
         seed: Option<NonZeroU64>,
         n: Option<NonZeroU64>,
     },
+    /// Get the routing table for testing
+    #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+    GetRoutingTable,
+    /// Get storage stats for testing
+    #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
+    GetStorageStats,
 }
 
 /// State of the actor that is required in the async handlers
@@ -645,11 +690,11 @@ struct Actor<P> {
 
 impl OnNodeSeen for irpc::Client<ApiProto> {
     async fn seen(&self, id: Id) {
-        let msg = NodeSeen {
-            info: NodeInfo {
+        let msg = NodesSeen {
+            info: vec![NodeInfo {
                 id,
                 last_seen: now(),
-            },
+            }],
         };
         self.notify(msg).await.ok();
     }
@@ -733,16 +778,26 @@ where
     /// Handle a single API message
     async fn handle_api(&mut self, message: ApiMessage) {
         match message {
-            ApiMessage::NodeSeen(msg) => {
+            ApiMessage::NodesSeen(msg) => {
                 // Update our routing table
-                self.node.routing_table.add_node(msg.info);
+                for info in msg.info.iter().copied() {
+                    self.node.routing_table.add_node(info);
+                }
+            }
+            ApiMessage::Lookup(msg) => {
+                let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
+                self.tasks.spawn(self.state.clone().lookup(
+                    initial.into_iter().map(|node| node.id).collect(),
+                    msg.inner,
+                    msg.tx,
+                ));
             }
             ApiMessage::NetworkGet(msg) => {
                 // perform a network get by calling the iterative search using the closest
                 // nodes from the local routing table, then performing individual requests
                 // for the resulting k closest live nodes.
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
-                self.tasks.spawn(self.state.clone().handle_network_get(
+                self.tasks.spawn(self.state.clone().network_get(
                     initial.into_iter().map(|node| node.id).collect(),
                     msg.inner,
                     msg.tx,
@@ -753,11 +808,33 @@ where
                 // nodes from the local routing table, then performing individual requests
                 // for the resulting k closest live nodes.
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
-                self.tasks.spawn(self.state.clone().handle_network_put(
+                self.tasks.spawn(self.state.clone().network_put(
                     initial.into_iter().map(|node| node.id).collect(),
                     msg.inner,
                     msg.tx,
                 ));
+            }
+            ApiMessage::GetRoutingTable(msg) => {
+                let table = self
+                    .node
+                    .routing_table
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.get_nodes().to_vec())
+                    .collect();
+                msg.tx.send(table).await.ok();
+            }
+            ApiMessage::GetStorageStats(msg) => {
+                // Collect storage stats, mapping Id to Kind to count of values
+                let mut stats = BTreeMap::new();
+                for (key, kinds) in &self.node.storage.data {
+                    let kind_stats = kinds
+                        .iter()
+                        .map(|(kind, values)| (kind.clone(), values.len()))
+                        .collect();
+                    stats.insert(*key, kind_stats);
+                }
+                msg.tx.send(stats).await.ok();
             }
         }
     }
@@ -823,7 +900,16 @@ where
 }
 
 impl<P: ClientPool> State<P> {
-    async fn handle_network_put(self, initial: Vec<Id>, msg: NetworkPut, tx: mpsc::Sender<Id>) {
+    async fn lookup(self, initial: Vec<Id>, msg: Lookup, tx: mpsc::Sender<Id>) {
+        let ids = self.clone().iterative_find_node(msg.id, initial).await;
+        for id in ids {
+            if tx.send(id).await.is_err() {
+                break; // Stop sending if the receiver is closed
+            }
+        }
+    }
+
+    async fn network_put(self, initial: Vec<Id>, msg: NetworkPut, tx: mpsc::Sender<Id>) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)
             .for_each_concurrent(self.config.parallelism, |id| {
@@ -841,12 +927,7 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
-    async fn handle_network_get(
-        self,
-        initial: Vec<Id>,
-        msg: NetworkGet,
-        tx: mpsc::Sender<(Id, Value)>,
-    ) {
+    async fn network_get(self, initial: Vec<Id>, msg: NetworkGet, tx: mpsc::Sender<(Id, Value)>) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)
             .for_each_concurrent(self.config.parallelism, |id| {
@@ -906,29 +987,14 @@ impl<P: ClientPool> State<P> {
                 .map(|id| (Distance::between(&target, &id), id))
                 .collect::<BTreeSet<_>>();
             let mut queried = HashSet::new();
-            queried.insert(self.pool.id());
-            let mut closest_distance = Distance::MAX;
             let mut tasks = FuturesUnordered::new();
             let mut result = BTreeSet::new();
             let mut i = 0;
-            let mut updated = true;
+            queried.insert(self.pool.id());
+            result.insert((Distance::between(&self.pool.id(), &target), self.pool.id()));
 
             loop {
-                i += 1;
-                if candidates.is_empty() {
-                    break;
-                }
-
-                let n = if updated {
-                    println!("Round {i}, distance {closest_distance:?}, using alpha: {}", self.config.alpha);
-                    self.config.alpha
-                } else {
-                    let n = self.config.k.saturating_sub(result.len());
-                    println!("Round {i}, distance {closest_distance:?}, getting {n} more results");
-                    n
-                };
-
-                for _ in 0..n {
+                for _ in 0..self.config.alpha {
                     let Some(pair @ (_, id)) = candidates.pop_first() else {
                         break;
                     };
@@ -937,45 +1003,48 @@ impl<P: ClientPool> State<P> {
                     tasks.push(async move { (pair, fut.await) });
                 }
 
-                updated = false;
-                while let Some((pair @ (dist, id), cands)) = tasks.next().await {
+                while let Some((pair @ (_, id), cands)) = tasks.next().await {
                     let Ok(cands) = cands else {
-                        // we must set updated to true so we don't exit early if there are failures in the first ALPHA candidates
-                        updated = true;
                         continue;
                     };
                     for cand in cands {
                         let dist = Distance::between(&target, &cand);
-                        let pair = (dist, cand);
                         if !queried.contains(&cand) {
-                            candidates.insert(pair);
+                            candidates.insert((dist, cand));
                         }
                     }
                     self.api
-                        .notify(NodeSeen {
-                            info: NodeInfo {
+                        .notify(NodesSeen {
+                            info: vec![NodeInfo {
                                 id,
                                 last_seen: now(),
-                            },
+                            }],
                         })
                         .await
                         .ok();
                     result.insert(pair);
-                    if dist < closest_distance {
-                        closest_distance = dist;
-                        updated = true;
-                    }
-                }
-
-                // we want to continue even if we didn't find a better candidate
-                // if we have less than K nodes.
-                if result.len() >= self.config.k && !updated {
-                    break;
                 }
 
                 // truncate the result to k.
                 while result.len() > self.config.k {
                     result.pop_last();
+                }
+
+                // find the k-th best distance
+                let kth_best_distance = result
+                    .iter()
+                    .nth(self.config.k - 1)
+                    .map(|(dist, _)| *dist)
+                    .unwrap_or(Distance::MAX);
+
+                // true if we candidates that are better than distance for result[k-1].
+                let has_closer_candidates = candidates
+                    .first()
+                    .map(|(dist, _)| *dist < kth_best_distance)
+                    .unwrap_or_default();
+
+                if !has_closer_candidates {
+                    break;
                 }
             }
 
@@ -1013,19 +1082,20 @@ fn create_node<E: ClientPool>(id: Id, bootstrap: Vec<Id>, endpoint: E) -> (RpcCl
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rand::Rng;
+    use rand::{Rng, rngs::StdRng, seq::SliceRandom};
+    use textplots::{Chart, Plot, Shape};
 
     use super::*;
 
     #[derive(Debug, Clone)]
-    struct TestEndpoint {
-        state: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
+    struct TestPool {
+        clients: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
         id: Id,
     }
 
-    impl ClientPool for TestEndpoint {
+    impl ClientPool for TestPool {
         async fn client(&self, id: Id) -> Result<RpcClient, &'static str> {
-            let state = self.state.lock().unwrap();
+            let state = self.clients.lock().unwrap();
             state.get(&id).cloned().ok_or("Client not found")
         }
 
@@ -1034,8 +1104,7 @@ mod tests {
         }
     }
 
-    fn expected_ids(ids: &[Id], data: &[u8], n: usize) -> Vec<Id> {
-        let key = Id::from(*blake3::hash(data).as_bytes());
+    fn expected_ids(ids: &[Id], key: Id, n: usize) -> Vec<Id> {
         let mut expected = ids
             .iter()
             .cloned()
@@ -1060,61 +1129,222 @@ mod tests {
     }
 
     fn sorted_ids(ids: &[Id], key: Id) -> BTreeSet<(Distance, Id)> {
-        ids.into_iter().map(|id| (Distance::between(id, &key), *id)).collect()
+        ids.into_iter()
+            .map(|id| (Distance::between(id, &key), *id))
+            .collect()
     }
 
-    fn sorted_ids_map(ids: &[Id], key: Id) -> BTreeMap<Distance, BTreeSet<Id>> {
-        let mut map: BTreeMap<Distance, BTreeSet<Id>> = BTreeMap::new();
-        for id in ids {
-            let dist = Distance::between(id, &key);
-            map.entry(dist).or_default().insert(*id);
-        }
-        map
+    type Nodes = Vec<(Id, (RpcClient, ApiClient))>;
+
+    fn rng(seed: u64) -> StdRng {
+        let mut expanded = [0; 32];
+        expanded[..8].copy_from_slice(&seed.to_le_bytes());
+        StdRng::from_seed(expanded)
     }
 
-    #[tokio::test]
-    async fn smoke() {
-        let n = 21;
-        let mut rng = rand::rngs::StdRng::from_seed([0; 32]);
-        let network = Arc::new(Mutex::new(BTreeMap::new()));
+    /// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
+    ///
+    /// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
+    async fn create_nodes(seed: u64, n: usize, mut n_bootstrap: usize) -> Nodes {
+        n_bootstrap = n_bootstrap.min(n - 1);
+        let mut rng = rng(seed);
+        let clients = Arc::new(Mutex::new(BTreeMap::new()));
         let ids = (0..n)
             .map(|_| Id::from(rng.r#gen::<[u8; 32]>()))
             .collect::<Vec<_>>();
+        // create n nodes
         let nodes = ids
             .iter()
             .enumerate()
             .map(|(offfset, id)| {
-                let endpoint = TestEndpoint {
-                    state: network.clone(),
+                let endpoint = TestPool {
+                    clients: clients.clone(),
                     id: *id,
                 };
-                let bootstrap = (0..20)
+                let bootstrap = (0..n_bootstrap)
                     .map(|i| ids[(offfset + i + 1) % n])
                     .collect::<Vec<_>>();
                 (*id, create_node(*id, bootstrap, endpoint))
             })
             .collect::<Vec<_>>();
-        network
+        clients
             .lock()
             .unwrap()
             .extend(nodes.iter().map(|(id, (rpc, _))| (*id, rpc.clone())));
-        let (_, (_, api)) = nodes[0].clone();
+        nodes
+    }
 
-        for i in 0..1 {
-            let text = format!("Item {i}");
-            let expected_ids = expected_ids(&ids, text.as_bytes(), 20);
-            let (hash, ids) = api.put_immutable(text.as_bytes()).await.unwrap();
-            println!("Actual IDs:");
-            print_ids(&ids, text.as_bytes());
-            println!("Expected IDs:");
-            print_ids(&expected_ids, text.as_bytes());
-            assert_eq!(expected_ids.len(), ids.len());
-            for i in 0..ids.len() {
-                assert_eq!(ids[i], expected_ids[i], "Mismatch at index {i}");
-            }
-            println!("Put immutable: hash = {}, ids = {:?}", hash, ids);
-            let data = api.get_immutable(hash).await.unwrap();
-            println!("Get immutable: data = {:?}", data);
+    async fn lookup_all(nodes: &Nodes, key: Id) -> irpc::Result<()> {
+        for (_, (_, api)) in nodes.iter() {
+            // perform a random lookup
+            api.lookup(key, None, Some(NonZeroU64::new(20).unwrap()))
+                .await?;
         }
+        Ok(())
+    }
+
+    /// Brute force init of the routing table of all nodes using a set of ids, that could be the full set.
+    ///
+    /// Provide a seed to shuffle the ids for each node.
+    async fn init_routing_tables(nodes: &Nodes, ids: &[Id], seed: Option<u64>) -> irpc::Result<()> {
+        let mut rng = seed.map(rng);
+        let mut ids = ids.to_vec();
+        for (_, (_, (_, api))) in nodes.iter().enumerate() {
+            if let Some(rng) = &mut rng {
+                ids.shuffle(rng);
+            }
+            api.nodes_seen(&ids).await?;
+        }
+        Ok(())
+    }
+
+    fn make_histogram(data: &[usize]) -> Vec<usize> {
+        let max = data.iter().max().cloned().unwrap_or(0);
+        let mut histogram = vec![0usize; max + 1];
+        for value in data.iter().cloned() {
+            histogram[value] += 1;
+        }
+        histogram
+    }
+
+    fn plot(title: &str, data: &[usize]) {
+        let data: Vec<(f32, f32)> = data
+            .iter()
+            .enumerate()
+            .map(|(items_stored, num_nodes)| (items_stored as f32, *num_nodes as f32))
+            .collect();
+
+        println!("{}", title);
+        Chart::new(100, 40, 0.0, (data.len() - 1) as f32)
+            .lineplot(&Shape::Bars(&data))
+            .nice();
+    }
+
+    async fn random_lookup(nodes: &Nodes, n: usize, seed: u64) -> irpc::Result<()> {
+        let mut rng = rng(seed);
+        for i in 0..n {
+            let key = Id::from(rng.r#gen::<[u8; 32]>());
+            lookup_all(&nodes, key).await?;
+        }
+        Ok(())
+    }
+
+    async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
+        let (_, (_, api)) = nodes[nodes.len() / 2].clone();
+        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let mut common_count = vec![0usize; n];
+        for i in 0..n {
+            let text = format!("Item {i}");
+            let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
+            let (hash, ids) = api.put_immutable(text.as_bytes()).await.unwrap();
+            let mut common = expected_ids.clone();
+            common.retain(|id| ids.contains(id));
+            common_count[i] = common.len();
+            let data = api.get_immutable(hash).await.unwrap();
+            assert_eq!(
+                data,
+                Some(text.as_bytes().to_vec()),
+                "Data mismatch for item {i}"
+            );
+        }
+
+        let mut storage_count = vec![0usize; nodes.len()];
+        let mut routing_table_size = vec![0usize; nodes.len()];
+        for (index, (_, (_, api))) in nodes.iter().enumerate() {
+            let stats = api.get_storage_stats().await?;
+            if !stats.is_empty() {
+                let n = stats
+                    .values()
+                    .map(|kinds| kinds.values().sum::<usize>())
+                    .sum::<usize>();
+                storage_count[index] = n;
+                // println!("Storage stats for node {index}: {n}");
+            }
+        }
+
+        for (index, (_, (_, api))) in nodes.iter().enumerate() {
+            let routing_table = api.get_routing_table().await?;
+            let count = routing_table.iter().map(|peers| peers.len()).sum::<usize>();
+            // println!("Routing table {index}: {count} nodes");
+            routing_table_size[index] = count;
+        }
+
+        plot("Histogram - Commonality with perfect set of 20 ids", &make_histogram(&common_count));
+        plot("Storage usage per node", &storage_count);
+        plot("Histogram - Storage usage per node", &make_histogram(&storage_count));
+        plot("Routing table size per node", &routing_table_size);
+        plot(
+            "Histogram - Routing table size per node",
+            &make_histogram(&routing_table_size),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_routing() {
+        let n = 1000;
+        let seed = 0;
+        let bootstrap = 0;
+        let nodes = create_nodes(seed, n, bootstrap).await;
+        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let clients = nodes.iter().cloned().collect::<BTreeMap<_, _>>();
+
+        for i in 0..100 {
+            let text = format!("Item {i}");
+            let key = Id::blake3_hash(text.as_bytes());
+            for id in expected_ids(&ids, key, 20) {
+                let (rpc, _) = clients.get(&id).expect("Node not found");
+                rpc.set(
+                    key,
+                    Value::Blake3Immutable(Blake3Immutable {
+                        timestamp: now(),
+                        data: text.as_bytes().to_vec(),
+                    }),
+                )
+                .await
+                .ok();
+            }
+        }
+
+        let mut storage_count = vec![0usize; nodes.len()];
+        for (index, (_, (_, api))) in nodes.iter().enumerate() {
+            let stats: BTreeMap<Id, BTreeMap<Kind, usize>> = api.get_storage_stats().await.unwrap();
+            if !stats.is_empty() {
+                let n = stats
+                    .values()
+                    .map(|kinds| kinds.values().sum::<usize>())
+                    .sum::<usize>();
+                storage_count[index] = n;
+                // println!("Storage {index}: {n}");
+            }
+        }
+        plot("Storage usage per node", &storage_count);
+        plot("Histogram - Storage usage per node", &make_histogram(&storage_count));
+    }
+
+    #[tokio::test]
+    async fn perfect_routing_tables() {
+        let n = 1000;
+        let seed = 0;
+        let bootstrap = 20;
+        let nodes = create_nodes(seed, n, bootstrap).await;
+        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+
+        // tell all nodes about all ids, shuffled for each node
+        init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
+        store_random_values(&nodes, 100).await.ok();
+    }
+
+    #[tokio::test]
+    async fn just_bootstrap() {
+        let n = 1000;
+        let seed = 0;
+        let bootstrap = 20;
+        let nodes = create_nodes(seed, n, bootstrap).await;
+        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+
+        // tell all nodes about all ids, shuffled for each node
+        // init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
+        store_random_values(&nodes, 100).await.ok();
     }
 }
