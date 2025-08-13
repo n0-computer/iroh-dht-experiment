@@ -47,25 +47,6 @@ fn expected_ids(ids: &[Id], key: Id, n: usize) -> Vec<Id> {
     expected.into_iter().map(|(_, id)| id).collect()
 }
 
-fn print_ids(ids: &[Id], data: &[u8]) {
-    let key = Id::from(*blake3::hash(data).as_bytes());
-    let ids_and_distance = ids
-        .iter()
-        .cloned()
-        .map(|id| (Distance::between(&id, &key), id))
-        .collect::<Vec<_>>();
-    println!("IDs:");
-    for (dist, id) in ids_and_distance {
-        println!(" - {} {}", id, dist);
-    }
-}
-
-fn sorted_ids(ids: &[Id], key: Id) -> BTreeSet<(Distance, Id)> {
-    ids.into_iter()
-        .map(|id| (Distance::between(id, &key), *id))
-        .collect()
-}
-
 type Nodes = Vec<(Id, (RpcClient, ApiClient))>;
 
 fn rng(seed: u64) -> StdRng {
@@ -117,7 +98,7 @@ async fn init_routing_tables(nodes: &Nodes, ids: &[Id], seed: Option<u64>) -> ir
     stream::iter(nodes.iter().enumerate())
         .for_each_concurrent(4096, |(index, (_, (_, api)))| {
             if ids.len() > 10000 {
-                println!("{}", index);
+                println!("{index}");
             }
             let mut ids = ids.clone();
             if let Some(rng) = &mut rng {
@@ -147,7 +128,7 @@ fn plot(title: &str, data: &[usize]) {
         .map(|(items_stored, num_nodes)| (items_stored as f32, *num_nodes as f32))
         .collect();
 
-    println!("{}", title);
+    println!("{title}");
     Chart::new(100, 40, 0.0, (data.len() - 1) as f32)
         .lineplot(&Shape::Bars(&data))
         .nice();
@@ -171,8 +152,8 @@ async fn random_lookup(nodes: &Nodes, rng: &mut StdRng) -> irpc::Result<()> {
 
 async fn random_lookup_n(nodes: &Nodes, n: usize, seed: u64) -> irpc::Result<()> {
     let mut rng = rng(seed);
-    for i in 0..n {
-        random_lookup(&nodes, &mut rng).await?;
+    for _ in 0..n {
+        random_lookup(nodes, &mut rng).await?;
     }
     Ok(())
 }
@@ -181,9 +162,10 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     let (_, (_, api)) = nodes[nodes.len() / 2].clone();
     let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let mut common_count = vec![0usize; n];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         if nodes.len() > 10000 {
-            println!("{}", i);
+            println!("{i}");
         }
         let text = format!("Item {i}");
         let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
@@ -240,6 +222,7 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
 /// Create routing table buckets for the given ids.
 ///
 /// Note that if there are a lot of ids, they won't all fit.
+#[allow(dead_code)]
 fn create_buckets(ids: &[Id]) -> Box<Buckets> {
     let mut routing_table = RoutingTable::new(Id::from([0; 32]), None);
     for id in ids {
@@ -325,7 +308,7 @@ async fn perfect_routing_tables_10k() {
 #[ignore = "runs very long and takes ~20GiB"]
 async fn perfect_routing_tables_100k() {
     let metrics = tokio::runtime::Handle::current().metrics();
-    println!("{:?}", metrics);
+    println!("{metrics:?}");
     let n = 100000;
     let seed = 0;
     let bootstrap = 0;

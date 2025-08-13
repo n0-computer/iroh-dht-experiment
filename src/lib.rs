@@ -20,16 +20,16 @@
 //! Examples of values:
 //!
 //! - Provider node ids for a key, where the key is interpreted as a BLAKE3 hash
-//! of some data. Expiry is a timestamp, validation is checking that the node
-//! has the data by means of a BLAKE3 probe.
+//!   of some data. Expiry is a timestamp, validation is checking that the node
+//!   has the data by means of a BLAKE3 probe.
 //!
 //! - A signed message, e.g. a pkarr record, where the key is interpreted as
-//! the public key of the signer. Expiry is a timestamp, validation is
-//! checking the signature against the public key.
+//!   the public key of the signer. Expiry is a timestamp, validation is
+//!   checking the signature against the public key.
 //!
 //! - Self-contained immutable data, where the key is interpreted as a BLAKE3
-//! hash of the data. Expiry is a timestamp, validation is checking that the
-//! data matches the hash.
+//!   hash of the data. Expiry is a timestamp, validation is checking that the
+//!   data matches the hash.
 //!
 //! Data storage will use postcard on the wire and most likely also on disk.
 //!
@@ -298,7 +298,7 @@ mod routing {
         /// This is the inverse of between.
         ///
         /// Distance::between(&x, &y).to_node(&y) == x
-        pub fn to_node(&self, target: &Id) -> Id {
+        pub fn inverse(&self, target: &Id) -> Id {
             Id::from(xor(&Id::from(self.0), target))
         }
 
@@ -307,7 +307,7 @@ mod routing {
 
     impl fmt::Debug for Distance {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "Distance({})", self)
+            write!(f, "Distance({self})")
         }
     }
 
@@ -459,7 +459,7 @@ mod routing {
 
             candidates
                 .into_iter()
-                .map(|dist| dist.to_node(target))
+                .map(|dist| dist.inverse(target))
                 .collect()
         }
     }
@@ -564,7 +564,7 @@ impl ApiClient {
             .await?;
         loop {
             match rx.recv().await {
-                Ok(Some((id, value))) => {
+                Ok(Some((_, value))) => {
                     let Value::Blake3Immutable(Blake3Immutable { data, .. }) = value else {
                         continue; // Skip non-Blake3Immutable values
                     };
@@ -890,7 +890,7 @@ where
                 for (key, kinds) in &self.node.storage.data {
                     let kind_stats = kinds
                         .iter()
-                        .map(|(kind, values)| (kind.clone(), values.len()))
+                        .map(|(kind, values)| (*kind, values.len()))
                         .collect();
                     stats.insert(*key, kind_stats);
                 }
@@ -936,11 +936,10 @@ where
                     let n = msg.n.map(|x| x.get()).unwrap_or(values.len() as u64) as usize;
                     let indices = sample(&mut rng, values.len(), n);
                     for i in indices {
-                        if let Some(value) = values.get_index(i) {
-                            if msg.tx.send(value.clone()).await.is_err() {
+                        if let Some(value) = values.get_index(i)
+                            && msg.tx.send(value.clone()).await.is_err() {
                                 break;
                             }
-                        }
                     }
                 } else {
                     // just send them in whatever order they return from the store.
@@ -1026,94 +1025,88 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
-    fn query_one(
+    async fn query_one(
         &self,
         id: Id,
         target: Id,
-        k: usize,
-    ) -> impl Future<Output = Result<Vec<Id>, &'static str>> + Send {
-        async move {
-            let ids = self
-                .pool
-                .with_client(id, move |client| async move {
-                    let mut ids = client.find_node(target).await?;
-                    std::result::Result::<Vec<Id>, Error>::Ok(ids)
-                })
-                .await
-                .map_err(|_| "Failed to query node")?;
-            Ok(ids)
-        }
+    ) -> Result<Vec<Id>, &'static str> {
+        let ids = self
+            .pool
+            .with_client(id, move |client| async move {
+                let ids = client.find_node(target).await?;
+                std::result::Result::<Vec<Id>, Error>::Ok(ids)
+            })
+            .await
+            .map_err(|_| "Failed to query node")?;
+        Ok(ids)
     }
 
-    fn iterative_find_node(
+    async fn iterative_find_node(
         self,
         target: Id,
         initial: Vec<Id>,
-    ) -> impl Future<Output = Vec<Id>> + Send {
-        async move {
-            let mut candidates = initial
-                .into_iter()
-                .filter(|id| *id != self.pool.id())
-                .map(|id| (Distance::between(&target, &id), id))
-                .collect::<BTreeSet<_>>();
-            let mut queried = HashSet::new();
-            let mut tasks = FuturesUnordered::new();
-            let mut result = BTreeSet::new();
-            let mut i = 0;
-            queried.insert(self.pool.id());
-            result.insert((Distance::between(&self.pool.id(), &target), self.pool.id()));
+    ) -> Vec<Id> {
+        let mut candidates = initial
+            .into_iter()
+            .filter(|id| *id != self.pool.id())
+            .map(|id| (Distance::between(&target, &id), id))
+            .collect::<BTreeSet<_>>();
+        let mut queried = HashSet::new();
+        let mut tasks = FuturesUnordered::new();
+        let mut result = BTreeSet::new();
+        queried.insert(self.pool.id());
+        result.insert((Distance::between(&self.pool.id(), &target), self.pool.id()));
 
-            loop {
-                for _ in 0..self.config.alpha {
-                    let Some(pair @ (_, id)) = candidates.pop_first() else {
-                        break;
-                    };
-                    queried.insert(id);
-                    let fut = self.query_one(id, target, self.config.k);
-                    tasks.push(async move { (pair, fut.await) });
-                }
-
-                while let Some((pair @ (_, id), cands)) = tasks.next().await {
-                    let Ok(cands) = cands else {
-                        self.api.nodes_dead(&[id]).await.ok();
-                        continue;
-                    };
-                    for cand in cands {
-                        let dist = Distance::between(&target, &cand);
-                        if !queried.contains(&cand) {
-                            candidates.insert((dist, cand));
-                        }
-                    }
-                    self.api.nodes_seen(&[id]).await.ok();
-                    result.insert(pair);
-                }
-
-                // truncate the result to k.
-                while result.len() > self.config.k {
-                    result.pop_last();
-                }
-
-                // find the k-th best distance
-                let kth_best_distance = result
-                    .iter()
-                    .nth(self.config.k - 1)
-                    .map(|(dist, _)| *dist)
-                    .unwrap_or(Distance::MAX);
-
-                // true if we candidates that are better than distance for result[k-1].
-                let has_closer_candidates = candidates
-                    .first()
-                    .map(|(dist, _)| *dist < kth_best_distance)
-                    .unwrap_or_default();
-
-                if !has_closer_candidates {
+        loop {
+            for _ in 0..self.config.alpha {
+                let Some(pair @ (_, id)) = candidates.pop_first() else {
                     break;
-                }
+                };
+                queried.insert(id);
+                let fut = self.query_one(id, target);
+                tasks.push(async move { (pair, fut.await) });
             }
 
-            // result already has size <= k
-            result.into_iter().map(|(_, id)| id).collect()
+            while let Some((pair @ (_, id), cands)) = tasks.next().await {
+                let Ok(cands) = cands else {
+                    self.api.nodes_dead(&[id]).await.ok();
+                    continue;
+                };
+                for cand in cands {
+                    let dist = Distance::between(&target, &cand);
+                    if !queried.contains(&cand) {
+                        candidates.insert((dist, cand));
+                    }
+                }
+                self.api.nodes_seen(&[id]).await.ok();
+                result.insert(pair);
+            }
+
+            // truncate the result to k.
+            while result.len() > self.config.k {
+                result.pop_last();
+            }
+
+            // find the k-th best distance
+            let kth_best_distance = result
+                .iter()
+                .nth(self.config.k - 1)
+                .map(|(dist, _)| *dist)
+                .unwrap_or(Distance::MAX);
+
+            // true if we candidates that are better than distance for result[k-1].
+            let has_closer_candidates = candidates
+                .first()
+                .map(|(dist, _)| *dist < kth_best_distance)
+                .unwrap_or_default();
+
+            if !has_closer_candidates {
+                break;
+            }
         }
+
+        // result already has size <= k
+        result.into_iter().map(|(_, id)| id).collect()
     }
 }
 
