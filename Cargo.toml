@@ -17,6 +17,7 @@ n0-future = "0.2.0"
 rand = "0.8.5"
 serde = { version = "1.0.219", features = ["derive"] }
 serde-big-array = "0.5.1"
+snafu = "0.8.6"
 textplots = "0.8.7"
 tokio = "1.47.1"
 tracing = "0.1.41"

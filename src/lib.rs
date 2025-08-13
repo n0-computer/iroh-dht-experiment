@@ -1,3 +1,42 @@
+//! # Minimal DHT for iroh
+//!
+//! A DHT is two things:
+//!
+//! ## Data storage
+//!
+//! A multimap of keys to values, where values are self contained pieces of data
+//! that have some way to be verified and have some relationship to the key.
+//!
+//! Values should have some kind of expiry mechanism, but they don't need
+//! provenance since they are self-contained.
+//!
+//! The storage part of the DHT is basically a standalone tracker, except for
+//! the fact that it will reject set requests that are obviously far away
+//! from the node id in terms of the DHT metric.
+//!
+//! Disabling the latter mechanism would allow a single DHT node to act as a
+//! tracker.
+//!
+//! Examples of values:
+//!
+//! - Provider node ids for a key, where the key is interpreted as a BLAKE3 hash
+//! of some data. Expiry is a timestamp, validation is checking that the node
+//! has the data by means of a BLAKE3 probe.
+//!
+//! - A signed message, e.g. a pkarr record, where the key is interpreted as
+//! the public key of the signer. Expiry is a timestamp, validation is
+//! checking the signature against the public key.
+//!
+//! - Self-contained immutable data, where the key is interpreted as a BLAKE3
+//! hash of the data. Expiry is a timestamp, validation is checking that the
+//! data matches the hash.
+//!
+//! Data storage will use postcard on the wire and most likely also on disk.
+//!
+//! ## Routing
+//!
+//! A way to find the n most natural locations for a given key. Routing is only
+//! concerned with the key, not the value.
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     num::NonZeroU64,
@@ -8,53 +47,19 @@ use futures_buffered::FuturesUnordered;
 use indexmap::IndexSet;
 use iroh::Endpoint;
 use iroh_base::SignatureError;
-use irpc::{
-    channel::{mpsc, none::NoSender, oneshot},
-    rpc_requests,
-};
+use irpc::channel::mpsc;
 use n0_future::{BufferedStreamExt, StreamExt, stream};
 use rand::{SeedableRng, seq::index::sample};
-use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 use tokio::task::JoinSet;
-
-/// A DHT is two things:
-///
-/// # Data storage
-///
-/// A multimap of keys to values, where values are self contained pieces of data
-/// that have some way to be verified and have some relationship to the key.
-///
-/// Values should have some kind of expiry mechanism, but they don't need
-/// provenance since they are self-contained.
-///
-/// The storage part of the DHT is basically a standalone tracker, except for
-/// the fact that it will reject set requests that are obviously far away
-/// from the node id in terms of the DHT metric.
-///
-/// Disabling the latter mechanism would allow a single DHT node to act as a
-/// tracker.
-///
-/// Examples of values:
-///
-/// - Provider node ids for a key, where the key is interpreted as a BLAKE3 hash
-/// of some data. Expiry is a timestamp, validation is checking that the node
-/// has the data by means of a BLAKE3 probe.
-///
-/// - A signed message, e.g. a pkarr record, where the key is interpreted as
-/// the public key of the signer. Expiry is a timestamp, validation is
-/// checking the signature against the public key.
-///
-/// - Self-contained immutable data, where the key is interpreted as a BLAKE3
-/// hash of the data. Expiry is a timestamp, validation is checking that the
-/// data matches the hash.
-///
-/// Data storage will use postcard on the wire and most likely also on disk.
-///
-/// # Routing
-///
-/// A way to find the n most natural locations for a given key. Routing is only
-/// concerned with the key, not the value.
-mod proto {
+#[cfg(test)]
+mod tests;
+pub mod proto {
+    //! RPC protocol that DHT nodes use to communicate with each other.
+    //!
+    //! These are low level operations that only affect the node being called.
+    //! E.g. finding closest nodes for a node based on the current content of
+    //! the routing table, as well as storing and getting values.
     use std::{fmt, num::NonZeroU64, ops::Deref};
 
     use irpc::{
@@ -243,13 +248,16 @@ mod proto {
         #[rpc(tx = oneshot::Sender<Pong>)]
         Ping(Ping),
         /// A request to query the routing table for the most natural locations
-        #[rpc(tx = mpsc::Sender<Id>)]
+        #[rpc(tx = oneshot::Sender<Vec<Id>>)]
         FindNode(FindNode),
     }
 }
 
 mod routing {
-    use std::fmt;
+    use std::{
+        fmt,
+        ops::{Index, IndexMut},
+    };
 
     use arrayvec::ArrayVec;
     use serde::{Deserialize, Serialize};
@@ -287,6 +295,13 @@ mod routing {
             Self(xor(a, b))
         }
 
+        /// This is the inverse of between.
+        ///
+        /// Distance::between(&x, &y).to_node(&y) == x
+        pub fn to_node(&self, target: &Id) -> Id {
+            Id::from(xor(&Id::from(self.0), target))
+        }
+
         pub const MAX: Self = Self([u8::MAX; 32]);
     }
 
@@ -314,7 +329,7 @@ mod routing {
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     pub(crate) struct KBucket {
         nodes: ArrayVec<NodeInfo, K>,
     }
@@ -348,20 +363,55 @@ mod routing {
             self.nodes.retain(|n| n.id != *id);
         }
 
-        pub fn get_nodes(&self) -> &[NodeInfo] {
+        pub fn nodes(&self) -> &[NodeInfo] {
             &self.nodes
         }
     }
 
     #[derive(Debug)]
     pub(crate) struct RoutingTable {
-        pub buckets: [Box<KBucket>; BUCKET_COUNT],
+        pub buckets: Box<Buckets>,
         local_id: Id,
     }
 
+    #[derive(Debug, Clone)]
+    pub(crate) struct Buckets([KBucket; BUCKET_COUNT]);
+
+    impl Buckets {
+        pub fn iter(&self) -> std::slice::Iter<'_, KBucket> {
+            self.0.iter()
+        }
+    }
+
+    impl Index<usize> for Buckets {
+        type Output = KBucket;
+        fn index(&self, index: usize) -> &Self::Output {
+            &self.0[index]
+        }
+    }
+
+    impl IndexMut<usize> for Buckets {
+        fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+            &mut self.0[index]
+        }
+    }
+
+    impl Default for Buckets {
+        fn default() -> Self {
+            Self(std::array::from_fn(|_| KBucket::new()))
+        }
+    }
+
     impl RoutingTable {
-        pub fn new(local_id: Id) -> Self {
-            let buckets = std::array::from_fn(|_| Box::new(KBucket::new()));
+        pub fn new(local_id: Id, buckets: Option<Box<Buckets>>) -> Self {
+            let buckets = buckets
+                .map(|mut buckets| {
+                    for bucket in buckets.0.iter_mut() {
+                        bucket.nodes.retain(|n| n.id != local_id);
+                    }
+                    buckets
+                })
+                .unwrap_or_default();
             Self { buckets, local_id }
         }
 
@@ -384,42 +434,47 @@ mod routing {
             self.buckets[bucket_idx].add_node(node)
         }
 
-        fn remove_node(&mut self, id: &Id) {
+        pub(crate) fn remove_node(&mut self, id: &Id) {
             let bucket_idx = self.bucket_index(id);
             self.buckets[bucket_idx].remove_node(id);
         }
 
         pub(crate) fn nodes(&self) -> impl Iterator<Item = &NodeInfo> {
-            self.buckets.iter().flat_map(|bucket| bucket.get_nodes())
+            self.buckets.iter().flat_map(|bucket| bucket.nodes())
         }
 
-        pub(crate) fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<NodeInfo> {
-            let mut candidates: Vec<(NodeInfo, Distance)> = Vec::new();
-
-            for bucket in &self.buckets {
-                for node in bucket.get_nodes() {
-                    let distance = Distance::between(target, &node.id);
-                    candidates.push((node.clone(), distance));
-                }
+        pub(crate) fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<Id> {
+            // this does a brute force scan, but even so it should be very fast.
+            // xor is basically free, and comparing distances as well.
+            // so the most expensive thing is probably the memory allocation.
+            //
+            // for a full routing table, this would be 256*20*32 = 163840 bytes.
+            let mut candidates = Vec::with_capacity(self.nodes().count());
+            candidates.extend(self.nodes().map(|node| Distance::between(target, &node.id)));
+            if k < candidates.len() {
+                candidates.select_nth_unstable(k - 1);
+                candidates.truncate(k);
             }
-
-            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+            candidates.sort_unstable();
 
             candidates
                 .into_iter()
-                .take(k)
-                .map(|(node, _)| node)
+                .map(|dist| dist.to_node(target))
                 .collect()
         }
     }
 }
 
 use crate::{
+    api::{
+        ApiMessage, GetRoutingTable, GetStorageStats, Lookup, NetworkGet, NetworkPut, NodesDead,
+        NodesSeen,
+    },
     proto::{
         Blake3Immutable, FindNode, GetAll, Id, Kind, Ping, Pong, RpcMessage, RpcRequests, Set,
         SetResponse, Value,
     },
-    routing::{ALPHA, Distance, K, NodeInfo, RoutingTable},
+    routing::{ALPHA, Buckets, Distance, K, NodeInfo, RoutingTable},
 };
 
 struct Node {
@@ -462,13 +517,18 @@ impl MemStorage {
 pub struct ApiClient(irpc::Client<ApiProto>);
 
 impl ApiClient {
+    /// notify the node that we have just seen these nodes.
+    ///
+    /// The impl should add these nodes to the routing table.
     pub async fn nodes_seen(&self, ids: &[Id]) -> irpc::Result<()> {
-        let last_seen = now();
-        let info = ids
-            .iter()
-            .map(|id| NodeInfo { id: *id, last_seen })
-            .collect();
-        self.0.notify(NodesSeen { info }).await
+        self.0.notify(NodesSeen { ids: ids.to_vec() }).await
+    }
+
+    /// notify the node that we have tried to contact these nodes and have not gotten a response.
+    ///
+    /// The impl can either clean these nodes from its routing table immediately or after a repeat offense.
+    pub async fn nodes_dead(&self, ids: &[Id]) -> irpc::Result<()> {
+        self.0.notify(NodesDead { ids: ids.to_vec() }).await
     }
 
     pub async fn get_storage_stats(&self) -> irpc::Result<BTreeMap<Id, BTreeMap<Kind, usize>>> {
@@ -586,37 +646,9 @@ impl RpcClient {
             .await
     }
 
-    pub fn find_node(&self, id: Id) -> FindNodeProgress {
-        FindNodeProgress(Box::pin(self.0.server_streaming(FindNode { id }, 32)))
+    pub async fn find_node(&self, id: Id) -> irpc::Result<Vec<Id>> {
+        self.0.rpc(FindNode { id }).await
     }
-}
-
-struct FindNodeProgress(n0_future::future::Boxed<irpc::Result<irpc::channel::mpsc::Receiver<Id>>>);
-
-impl FindNodeProgress {
-    /// Collects up to `n` node ids from the find_node stream.
-    pub async fn collect(self, n: usize) -> irpc::Result<Vec<Id>> {
-        let mut stream = self.0.await?;
-        let mut ids = Vec::new();
-        for _ in 0..n {
-            if let Ok(Some(id)) = stream.recv().await {
-                ids.push(id);
-            } else {
-                break;
-            }
-        }
-        Ok(ids)
-    }
-}
-
-#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
-pub struct DistanceAndId {
-    pub distance: Distance,
-    pub id: Id,
-}
-
-pub trait OnNodeSeen: Send {
-    fn seen(&self, id: Id) -> impl Future<Output = ()> + Send;
 }
 
 /// A pool that can efficiently provide clients given a node id, and knows its
@@ -628,48 +660,78 @@ pub trait ClientPool: Send + Sync + Clone + Sized + 'static {
     /// Our own node id
     fn id(&self) -> Id;
 
-    /// Hook to get or create a client for a remote Id. Use your pool/0-RTT here.
-    fn client(&self, id: Id) -> impl Future<Output = Result<RpcClient, &'static str>> + Send;
+    /// Use the client to perform an operation.
+    ///
+    /// You must not clone the client out of the closure. If you do, this client
+    /// can become unusable at any time!
+    fn with_client<F, Fut, R, E>(&self, id: Id, f: F) -> impl Future<Output = Result<R, E>> + Send
+    where
+        F: FnOnce(RpcClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+        R: Send + 'static,
+        E: From<PoolError>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PutProgressItem {
-    id: Id,
+/// Error when a pool can not obtain a client.
+#[derive(Debug, Snafu)]
+pub struct PoolError {
+    message: &'static str,
 }
 
-#[rpc_requests(message = ApiMessage)]
-#[derive(Debug, Serialize, Deserialize)]
-enum ApiProto {
-    #[rpc(wrap, tx = NoSender)]
-    NodesSeen { info: Vec<NodeInfo> },
-    #[rpc(wrap, tx = mpsc::Sender<Id>)]
-    Lookup {
-        id: Id,
-        seed: Option<NonZeroU64>,
-        n: Option<NonZeroU64>,
-    },
-    #[rpc(wrap, tx = mpsc::Sender<Id>)]
-    NetworkPut { id: Id, value: Value },
-    #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
-    NetworkGet {
-        id: Id,
-        kind: Kind,
-        seed: Option<NonZeroU64>,
-        n: Option<NonZeroU64>,
-    },
-    /// Get the routing table for testing
-    #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
-    GetRoutingTable,
-    /// Get storage stats for testing
-    #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
-    GetStorageStats,
+pub mod api {
+    //! RPC protocol for an user to talk to a DHT node.
+    //!
+    //! These are operations that affect the entire network, such as storing or retrieving a value.
+    use std::{collections::BTreeMap, num::NonZeroU64};
+
+    use irpc::{
+        channel::{mpsc, none::NoSender, oneshot},
+        rpc_requests,
+    };
+    use serde::{Deserialize, Serialize};
+
+    use crate::{
+        proto::{Id, Kind, Value},
+        routing::NodeInfo,
+    };
+
+    #[rpc_requests(message = ApiMessage)]
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum ApiProto {
+        #[rpc(wrap, tx = NoSender)]
+        NodesSeen { ids: Vec<Id> },
+        #[rpc(wrap, tx = NoSender)]
+        NodesDead { ids: Vec<Id> },
+        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        Lookup {
+            id: Id,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        },
+        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        NetworkPut { id: Id, value: Value },
+        #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
+        NetworkGet {
+            id: Id,
+            kind: Kind,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        },
+        /// Get the routing table for testing
+        #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+        GetRoutingTable,
+        /// Get storage stats for testing
+        #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
+        GetStorageStats,
+    }
 }
+use api::ApiProto;
 
 /// State of the actor that is required in the async handlers
 #[derive(Debug, Clone)]
 struct State<P> {
     /// ability to send messages to ourselves, e.g. to update the routing table
-    api: irpc::Client<ApiProto>,
+    api: ApiClient,
     /// client pool
     pool: P,
     /// configuration
@@ -686,18 +748,6 @@ struct Actor<P> {
     tasks: JoinSet<()>,
     /// state
     state: State<P>,
-}
-
-impl OnNodeSeen for irpc::Client<ApiProto> {
-    async fn seen(&self, id: Id) {
-        let msg = NodesSeen {
-            info: vec![NodeInfo {
-                id,
-                last_seen: now(),
-            }],
-        };
-        self.notify(msg).await.ok();
-    }
 }
 
 /// Dht lookup config
@@ -722,17 +772,29 @@ impl Default for Config {
     }
 }
 
-impl<E> Actor<E>
+#[derive(Debug, Snafu)]
+enum Error {
+    #[snafu(transparent)]
+    Client { source: PoolError },
+    #[snafu(transparent)]
+    Irpc { source: irpc::Error },
+}
+
+impl From<irpc::channel::SendError> for Error {
+    fn from(source: irpc::channel::SendError) -> Self {
+        Self::Irpc {
+            source: irpc::Error::from(source),
+        }
+    }
+}
+
+impl<P> Actor<P>
 where
-    E: ClientPool,
+    P: ClientPool,
 {
-    fn new(
-        node: Node,
-        rx: tokio::sync::mpsc::Receiver<RpcMessage>,
-        endpoint: E,
-    ) -> (Self, irpc::Client<ApiProto>) {
+    fn new(node: Node, rx: tokio::sync::mpsc::Receiver<RpcMessage>, pool: P) -> (Self, ApiClient) {
         let (api_tx, internal_rx) = tokio::sync::mpsc::channel(32);
-        let api: irpc::Client<ApiProto> = api_tx.into();
+        let api = ApiClient(api_tx.into());
         (
             Self {
                 node,
@@ -741,7 +803,7 @@ where
                 tasks: JoinSet::new(),
                 state: State {
                     api: api.clone(),
-                    pool: endpoint,
+                    pool,
                     config: Config::default(),
                 },
             },
@@ -779,40 +841,38 @@ where
     async fn handle_api(&mut self, message: ApiMessage) {
         match message {
             ApiMessage::NodesSeen(msg) => {
-                // Update our routing table
-                for info in msg.info.iter().copied() {
-                    self.node.routing_table.add_node(info);
+                let now = now();
+                for id in msg.ids.iter().copied() {
+                    self.node
+                        .routing_table
+                        .add_node(NodeInfo { id, last_seen: now });
+                }
+            }
+            ApiMessage::NodesDead(msg) => {
+                for id in msg.ids.iter() {
+                    self.node.routing_table.remove_node(id);
                 }
             }
             ApiMessage::Lookup(msg) => {
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
-                self.tasks.spawn(self.state.clone().lookup(
-                    initial.into_iter().map(|node| node.id).collect(),
-                    msg.inner,
-                    msg.tx,
-                ));
+                self.tasks
+                    .spawn(self.state.clone().lookup(initial, msg.inner, msg.tx));
             }
             ApiMessage::NetworkGet(msg) => {
                 // perform a network get by calling the iterative search using the closest
                 // nodes from the local routing table, then performing individual requests
                 // for the resulting k closest live nodes.
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
-                self.tasks.spawn(self.state.clone().network_get(
-                    initial.into_iter().map(|node| node.id).collect(),
-                    msg.inner,
-                    msg.tx,
-                ));
+                self.tasks
+                    .spawn(self.state.clone().network_get(initial, msg.inner, msg.tx));
             }
             ApiMessage::NetworkPut(msg) => {
                 // perform a network put by calling the iterative search using the closest
                 // nodes from the local routing table, then performing individual requests
                 // for the resulting k closest live nodes.
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
-                self.tasks.spawn(self.state.clone().network_put(
-                    initial.into_iter().map(|node| node.id).collect(),
-                    msg.inner,
-                    msg.tx,
-                ));
+                self.tasks
+                    .spawn(self.state.clone().network_put(initial, msg.inner, msg.tx));
             }
             ApiMessage::GetRoutingTable(msg) => {
                 let table = self
@@ -820,7 +880,7 @@ where
                     .routing_table
                     .buckets
                     .iter()
-                    .map(|bucket| bucket.get_nodes().to_vec())
+                    .map(|bucket| bucket.nodes().to_vec())
                     .collect();
                 msg.tx.send(table).await.ok();
             }
@@ -844,12 +904,24 @@ where
             RpcMessage::Set(msg) => {
                 // just set the value in the local storage
                 //
-                // TODO: sanity check that this node is a good node to store
-                // the data at, using the local routing table, and if not return
-                // a SetResponse::ErrDistance.
-                //
                 // TODO: check if the data is expired or invalid and return the
                 // appropriate error response.
+                //
+                // Sanity check that this node is a good node to store
+                // the data at, using the local routing table, and if not return
+                // a SetResponse::ErrDistance.
+                let ids = self
+                    .node
+                    .routing_table
+                    .find_closest_nodes(&msg.key, self.state.config.k);
+                let self_dist = Distance::between(&self.node.id, &msg.key);
+                if ids
+                    .iter()
+                    .all(|id| Distance::between(&self.node.id, id) < self_dist)
+                {
+                    msg.tx.send(SetResponse::ErrDistance).await.ok();
+                    return;
+                }
                 self.node.storage.set(msg.key, msg.value.clone());
                 msg.tx.send(SetResponse::Ok).await.ok();
             }
@@ -885,15 +957,11 @@ where
             }
             RpcMessage::FindNode(msg) => {
                 // call local find_node and just return the results
-                let nodes = self
+                let ids = self
                     .node
                     .routing_table
                     .find_closest_nodes(&msg.id, self.state.config.k);
-                for node in nodes {
-                    if msg.tx.send(node.id).await.is_err() {
-                        break;
-                    }
-                }
+                msg.tx.send(ids).await.ok();
             }
         }
     }
@@ -917,11 +985,14 @@ impl<P: ClientPool> State<P> {
                 let value = msg.value.clone();
                 let tx = tx.clone();
                 async move {
-                    if let Ok(client) = pool.client(id).await {
+                    pool.with_client(id, move |client| async move {
                         if client.set(msg.id, value).await.is_ok() {
-                            tx.send(id).await.ok();
+                            tx.send(id).await?;
                         }
-                    }
+                        std::result::Result::<(), Error>::Ok(())
+                    })
+                    .await
+                    .ok();
                 }
             })
             .await;
@@ -933,26 +1004,23 @@ impl<P: ClientPool> State<P> {
             .for_each_concurrent(self.config.parallelism, |id| {
                 let pool = self.pool.clone();
                 let tx = tx.clone();
+                let msg = NetworkGet {
+                    id: msg.id,
+                    kind: msg.kind,
+                    seed: msg.seed,
+                    n: msg.n,
+                };
                 async move {
-                    let Ok(client) = pool.client(id).await else {
-                        return;
-                    };
-                    let Ok(mut rx) = client.get_all(msg.id, msg.kind, msg.seed, msg.n).await else {
-                        return;
-                    };
-                    loop {
-                        match rx.recv().await {
-                            Ok(Some(value)) => {
-                                tx.send((id, value)).await.ok();
-                            }
-                            Ok(None) => {
-                                break;
-                            }
-                            Err(_) => {
-                                continue;
-                            }
+                    pool.with_client(id, move |client| async move {
+                        // Get all values of the specified kind for the key
+                        let mut rx = client.get_all(msg.id, msg.kind, msg.seed, msg.n).await?;
+                        while let Ok(Some(value)) = rx.recv().await {
+                            tx.send((id, value)).await?;
                         }
-                    }
+                        std::result::Result::<(), Error>::Ok(())
+                    })
+                    .await
+                    .ok();
                 }
             })
             .await;
@@ -965,13 +1033,15 @@ impl<P: ClientPool> State<P> {
         k: usize,
     ) -> impl Future<Output = Result<Vec<Id>, &'static str>> + Send {
         async move {
-            let client = self.pool.client(id).await?;
-            let result = client
-                .find_node(target)
-                .collect(k / 2)
+            let ids = self
+                .pool
+                .with_client(id, move |client| async move {
+                    let mut ids = client.find_node(target).await?;
+                    std::result::Result::<Vec<Id>, Error>::Ok(ids)
+                })
                 .await
-                .map_err(|_| "Failed to call find_node")?;
-            Ok(result)
+                .map_err(|_| "Failed to query node")?;
+            Ok(ids)
         }
     }
 
@@ -1005,6 +1075,7 @@ impl<P: ClientPool> State<P> {
 
                 while let Some((pair @ (_, id), cands)) = tasks.next().await {
                     let Ok(cands) = cands else {
+                        self.api.nodes_dead(&[id]).await.ok();
                         continue;
                     };
                     for cand in cands {
@@ -1013,15 +1084,7 @@ impl<P: ClientPool> State<P> {
                             candidates.insert((dist, cand));
                         }
                     }
-                    self.api
-                        .notify(NodesSeen {
-                            info: vec![NodeInfo {
-                                id,
-                                last_seen: now(),
-                            }],
-                        })
-                        .await
-                        .ok();
+                    self.api.nodes_seen(&[id]).await.ok();
                     result.insert(pair);
                 }
 
@@ -1058,10 +1121,21 @@ fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap().as_secs()
 }
 
-fn create_node<E: ClientPool>(id: Id, bootstrap: Vec<Id>, endpoint: E) -> (RpcClient, ApiClient) {
+/// Creates a DHT node
+pub fn create_node<P: ClientPool>(id: Id, pool: P, bootstrap: Vec<Id>) -> (RpcClient, ApiClient) {
+    create_node_impl(id, pool, bootstrap, None)
+}
+
+/// Create a node, given an id, a set of bootstrap nodes, a
+fn create_node_impl<P: ClientPool>(
+    id: Id,
+    pool: P,
+    bootstrap: Vec<Id>,
+    buckets: Option<Box<Buckets>>,
+) -> (RpcClient, ApiClient) {
     let mut node = Node {
         id,
-        routing_table: RoutingTable::new(id),
+        routing_table: RoutingTable::new(id, buckets),
         storage: MemStorage::new(),
     };
     for bootstrap_id in bootstrap {
@@ -1073,278 +1147,7 @@ fn create_node<E: ClientPool>(id: Id, bootstrap: Vec<Id>, endpoint: E) -> (RpcCl
         }
     }
     let (tx, rx) = tokio::sync::mpsc::channel(32);
-    let (actor, client) = Actor::<E>::new(node, rx, endpoint);
+    let (actor, api) = Actor::<P>::new(node, rx, pool);
     tokio::spawn(actor.run());
-    (RpcClient(irpc::Client::local(tx)), ApiClient(client))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use rand::{Rng, rngs::StdRng, seq::SliceRandom};
-    use textplots::{Chart, Plot, Shape};
-
-    use super::*;
-
-    #[derive(Debug, Clone)]
-    struct TestPool {
-        clients: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
-        id: Id,
-    }
-
-    impl ClientPool for TestPool {
-        async fn client(&self, id: Id) -> Result<RpcClient, &'static str> {
-            let state = self.clients.lock().unwrap();
-            state.get(&id).cloned().ok_or("Client not found")
-        }
-
-        fn id(&self) -> Id {
-            self.id
-        }
-    }
-
-    fn expected_ids(ids: &[Id], key: Id, n: usize) -> Vec<Id> {
-        let mut expected = ids
-            .iter()
-            .cloned()
-            .map(|id| (Distance::between(&id, &key), id))
-            .collect::<Vec<_>>();
-        expected.sort();
-        expected.truncate(n);
-        expected.into_iter().map(|(_, id)| id).collect()
-    }
-
-    fn print_ids(ids: &[Id], data: &[u8]) {
-        let key = Id::from(*blake3::hash(data).as_bytes());
-        let ids_and_distance = ids
-            .iter()
-            .cloned()
-            .map(|id| (Distance::between(&id, &key), id))
-            .collect::<Vec<_>>();
-        println!("IDs:");
-        for (dist, id) in ids_and_distance {
-            println!(" - {} {}", id, dist);
-        }
-    }
-
-    fn sorted_ids(ids: &[Id], key: Id) -> BTreeSet<(Distance, Id)> {
-        ids.into_iter()
-            .map(|id| (Distance::between(id, &key), *id))
-            .collect()
-    }
-
-    type Nodes = Vec<(Id, (RpcClient, ApiClient))>;
-
-    fn rng(seed: u64) -> StdRng {
-        let mut expanded = [0; 32];
-        expanded[..8].copy_from_slice(&seed.to_le_bytes());
-        StdRng::from_seed(expanded)
-    }
-
-    /// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
-    ///
-    /// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
-    async fn create_nodes(seed: u64, n: usize, mut n_bootstrap: usize) -> Nodes {
-        n_bootstrap = n_bootstrap.min(n - 1);
-        let mut rng = rng(seed);
-        let clients = Arc::new(Mutex::new(BTreeMap::new()));
-        let ids = (0..n)
-            .map(|_| Id::from(rng.r#gen::<[u8; 32]>()))
-            .collect::<Vec<_>>();
-        // create n nodes
-        let nodes = ids
-            .iter()
-            .enumerate()
-            .map(|(offfset, id)| {
-                let endpoint = TestPool {
-                    clients: clients.clone(),
-                    id: *id,
-                };
-                let bootstrap = (0..n_bootstrap)
-                    .map(|i| ids[(offfset + i + 1) % n])
-                    .collect::<Vec<_>>();
-                (*id, create_node(*id, bootstrap, endpoint))
-            })
-            .collect::<Vec<_>>();
-        clients
-            .lock()
-            .unwrap()
-            .extend(nodes.iter().map(|(id, (rpc, _))| (*id, rpc.clone())));
-        nodes
-    }
-
-    async fn lookup_all(nodes: &Nodes, key: Id) -> irpc::Result<()> {
-        for (_, (_, api)) in nodes.iter() {
-            // perform a random lookup
-            api.lookup(key, None, Some(NonZeroU64::new(20).unwrap()))
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Brute force init of the routing table of all nodes using a set of ids, that could be the full set.
-    ///
-    /// Provide a seed to shuffle the ids for each node.
-    async fn init_routing_tables(nodes: &Nodes, ids: &[Id], seed: Option<u64>) -> irpc::Result<()> {
-        let mut rng = seed.map(rng);
-        let mut ids = ids.to_vec();
-        for (_, (_, (_, api))) in nodes.iter().enumerate() {
-            if let Some(rng) = &mut rng {
-                ids.shuffle(rng);
-            }
-            api.nodes_seen(&ids).await?;
-        }
-        Ok(())
-    }
-
-    fn make_histogram(data: &[usize]) -> Vec<usize> {
-        let max = data.iter().max().cloned().unwrap_or(0);
-        let mut histogram = vec![0usize; max + 1];
-        for value in data.iter().cloned() {
-            histogram[value] += 1;
-        }
-        histogram
-    }
-
-    fn plot(title: &str, data: &[usize]) {
-        let data: Vec<(f32, f32)> = data
-            .iter()
-            .enumerate()
-            .map(|(items_stored, num_nodes)| (items_stored as f32, *num_nodes as f32))
-            .collect();
-
-        println!("{}", title);
-        Chart::new(100, 40, 0.0, (data.len() - 1) as f32)
-            .lineplot(&Shape::Bars(&data))
-            .nice();
-    }
-
-    async fn random_lookup(nodes: &Nodes, n: usize, seed: u64) -> irpc::Result<()> {
-        let mut rng = rng(seed);
-        for i in 0..n {
-            let key = Id::from(rng.r#gen::<[u8; 32]>());
-            lookup_all(&nodes, key).await?;
-        }
-        Ok(())
-    }
-
-    async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
-        let (_, (_, api)) = nodes[nodes.len() / 2].clone();
-        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let mut common_count = vec![0usize; n];
-        for i in 0..n {
-            let text = format!("Item {i}");
-            let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
-            let (hash, ids) = api.put_immutable(text.as_bytes()).await.unwrap();
-            let mut common = expected_ids.clone();
-            common.retain(|id| ids.contains(id));
-            common_count[i] = common.len();
-            let data = api.get_immutable(hash).await.unwrap();
-            assert_eq!(
-                data,
-                Some(text.as_bytes().to_vec()),
-                "Data mismatch for item {i}"
-            );
-        }
-
-        let mut storage_count = vec![0usize; nodes.len()];
-        let mut routing_table_size = vec![0usize; nodes.len()];
-        for (index, (_, (_, api))) in nodes.iter().enumerate() {
-            let stats = api.get_storage_stats().await?;
-            if !stats.is_empty() {
-                let n = stats
-                    .values()
-                    .map(|kinds| kinds.values().sum::<usize>())
-                    .sum::<usize>();
-                storage_count[index] = n;
-                // println!("Storage stats for node {index}: {n}");
-            }
-        }
-
-        for (index, (_, (_, api))) in nodes.iter().enumerate() {
-            let routing_table = api.get_routing_table().await?;
-            let count = routing_table.iter().map(|peers| peers.len()).sum::<usize>();
-            // println!("Routing table {index}: {count} nodes");
-            routing_table_size[index] = count;
-        }
-
-        plot("Histogram - Commonality with perfect set of 20 ids", &make_histogram(&common_count));
-        plot("Storage usage per node", &storage_count);
-        plot("Histogram - Storage usage per node", &make_histogram(&storage_count));
-        plot("Routing table size per node", &routing_table_size);
-        plot(
-            "Histogram - Routing table size per node",
-            &make_histogram(&routing_table_size),
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn no_routing() {
-        let n = 1000;
-        let seed = 0;
-        let bootstrap = 0;
-        let nodes = create_nodes(seed, n, bootstrap).await;
-        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let clients = nodes.iter().cloned().collect::<BTreeMap<_, _>>();
-
-        for i in 0..100 {
-            let text = format!("Item {i}");
-            let key = Id::blake3_hash(text.as_bytes());
-            for id in expected_ids(&ids, key, 20) {
-                let (rpc, _) = clients.get(&id).expect("Node not found");
-                rpc.set(
-                    key,
-                    Value::Blake3Immutable(Blake3Immutable {
-                        timestamp: now(),
-                        data: text.as_bytes().to_vec(),
-                    }),
-                )
-                .await
-                .ok();
-            }
-        }
-
-        let mut storage_count = vec![0usize; nodes.len()];
-        for (index, (_, (_, api))) in nodes.iter().enumerate() {
-            let stats: BTreeMap<Id, BTreeMap<Kind, usize>> = api.get_storage_stats().await.unwrap();
-            if !stats.is_empty() {
-                let n = stats
-                    .values()
-                    .map(|kinds| kinds.values().sum::<usize>())
-                    .sum::<usize>();
-                storage_count[index] = n;
-                // println!("Storage {index}: {n}");
-            }
-        }
-        plot("Storage usage per node", &storage_count);
-        plot("Histogram - Storage usage per node", &make_histogram(&storage_count));
-    }
-
-    #[tokio::test]
-    async fn perfect_routing_tables() {
-        let n = 1000;
-        let seed = 0;
-        let bootstrap = 20;
-        let nodes = create_nodes(seed, n, bootstrap).await;
-        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-
-        // tell all nodes about all ids, shuffled for each node
-        init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-        store_random_values(&nodes, 100).await.ok();
-    }
-
-    #[tokio::test]
-    async fn just_bootstrap() {
-        let n = 1000;
-        let seed = 0;
-        let bootstrap = 20;
-        let nodes = create_nodes(seed, n, bootstrap).await;
-        let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-
-        // tell all nodes about all ids, shuffled for each node
-        // init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-        store_random_values(&nodes, 100).await.ok();
-    }
+    (RpcClient(irpc::Client::local(tx)), api)
 }
