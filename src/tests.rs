@@ -1,9 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+};
 
 use rand::{Rng, rngs::StdRng, seq::SliceRandom};
 use textplots::{Chart, Plot, Shape};
 
 use super::*;
+use crate::proto::Blake3Immutable;
 
 #[derive(Debug, Clone)]
 struct TestPool {
@@ -350,7 +354,7 @@ async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn random_lookup_1k() {
-    for lookups in 1..10 {
+    for lookups in 0..10 {
         random_lookup_test(1000, 0, lookups).await;
     }
 }

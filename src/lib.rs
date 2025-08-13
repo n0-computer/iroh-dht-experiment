@@ -39,14 +39,11 @@
 //! concerned with the key, not the value.
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    num::NonZeroU64,
     time::UNIX_EPOCH,
 };
 
 use futures_buffered::FuturesUnordered;
 use indexmap::IndexSet;
-use iroh::Endpoint;
-use iroh_base::SignatureError;
 use irpc::channel::mpsc;
 use n0_future::{BufferedStreamExt, StreamExt, stream};
 use rand::{SeedableRng, seq::index::sample};
@@ -55,13 +52,21 @@ use tokio::task::JoinSet;
 #[cfg(test)]
 mod tests;
 pub mod proto {
-    //! RPC protocol that DHT nodes use to communicate with each other.
+    //! RPC protocol between DHT nodes.
     //!
     //! These are low level operations that only affect the node being called.
     //! E.g. finding closest nodes for a node based on the current content of
-    //! the routing table, as well as storing and getting values.
+    //! the routing table, as well as storing and retrieving values from the
+    //! node itself.
+    //!
+    //! The protocol is defined in [`RpcProto`], which has a corresponding full
+    //! message type [`RpcMessage`].
+    //!
+    //! The entry point is [`RpcClient`].
     use std::{fmt, num::NonZeroU64, ops::Deref};
 
+    use iroh::Endpoint;
+    use iroh_base::SignatureError;
     use irpc::{
         channel::{mpsc, oneshot},
         rpc_requests,
@@ -81,10 +86,7 @@ pub mod proto {
         node_id: [u8; 32],
     }
 
-    /// Entry type for BLAKE3 content discovery.
-    ///
-    /// Provides a similar functionality to BEP-5 in mainline, but for BLAKE3
-    /// hashes instead of SHA-1 hashes.
+    /// Small immutable value.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Blake3Immutable {
         pub timestamp: u64, // Unix timestamp for expiry
@@ -107,6 +109,8 @@ pub mod proto {
         pub data: Vec<u8>,
     }
 
+    /// DHT value type.
+    ///
     /// The order of the enum is important for serialization/deserialization
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Value {
@@ -126,7 +130,9 @@ pub mod proto {
         }
     }
 
-    /// Must have the same order as `Value` for serialization/deserialization
+    /// DHT value kind type.
+    ///
+    /// Must have the same order as [`Value`] for serialization/deserialization
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Kind {
         Blake3Provider,
@@ -221,13 +227,6 @@ pub mod proto {
         pub n: Option<NonZeroU64>,
     }
 
-    /// A ping request to check if the node is alive and reachable.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct Ping;
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct Pong;
-
     /// A request to query the routing table for the most natural locations
     #[derive(Debug, Serialize, Deserialize)]
     pub struct FindNode {
@@ -235,23 +234,215 @@ pub mod proto {
         pub id: Id,
     }
 
+    /// Protocol for rpc communication.
+    ///
+    /// Note: you might wonder why there is no ping message. To do a basic
+    /// liveness check, just do a FindNode with a random ID. It should be just
+    /// as cheap in terms of roundtrips, and already gives you some useful
+    /// information.
     #[rpc_requests(message = RpcMessage)]
     #[derive(Debug, Serialize, Deserialize)]
-    pub enum RpcRequests {
+    pub enum RpcProto {
         /// Set a key to a value.
         #[rpc(tx = oneshot::Sender<SetResponse>)]
         Set(Set),
         /// Get all values of a certain kind for a key, as a stream of values.
         #[rpc(tx = mpsc::Sender<Value>)]
         GetAll(GetAll),
-        /// A ping request to check if the node is alive and reachable.    
-        #[rpc(tx = oneshot::Sender<Pong>)]
-        Ping(Ping),
         /// A request to query the routing table for the most natural locations
         #[rpc(tx = oneshot::Sender<Vec<Id>>)]
         FindNode(FindNode),
     }
+
+    #[derive(Debug, Clone)]
+    pub struct RpcClient(pub(crate) irpc::Client<RpcProto>);
+
+    impl RpcClient {
+        pub fn remote(endpoint: Endpoint, id: Id) -> std::result::Result<Self, SignatureError> {
+            let id = iroh::NodeId::from_bytes(&id)?;
+            let client = irpc_iroh::client(endpoint, id, ALPN);
+            Ok(Self(client))
+        }
+
+        pub fn new(client: irpc::Client<RpcProto>) -> Self {
+            Self(client)
+        }
+
+        pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
+            self.0.rpc(Set { key, value }).await
+        }
+
+        pub async fn get_all(
+            &self,
+            key: Id,
+            kind: Kind,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        ) -> irpc::Result<irpc::channel::mpsc::Receiver<Value>> {
+            self.0
+                .server_streaming(GetAll { key, kind, seed, n }, 32)
+                .await
+        }
+
+        pub async fn find_node(&self, id: Id) -> irpc::Result<Vec<Id>> {
+            self.0.rpc(FindNode { id }).await
+        }
+    }
 }
+
+pub mod api {
+    //! RPC protocol for an user to talk to a DHT node.
+    //!
+    //! These are operations that affect the entire network, such as storing or retrieving a value.
+    //!
+    //! The protocol is defined in [`ApiProto`], which has a corresponding full
+    //! message type [`ApiMessage`].
+    //!
+    //! The entry point is [`ApiClient`].
+    use std::{collections::BTreeMap, num::NonZeroU64};
+
+    use irpc::{
+        channel::{mpsc, none::NoSender, oneshot},
+        rpc_requests,
+    };
+    use serde::{Deserialize, Serialize};
+
+    use crate::{
+        now,
+        proto::{Blake3Immutable, Id, Kind, Value},
+        routing::NodeInfo,
+    };
+
+    #[rpc_requests(message = ApiMessage)]
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum ApiProto {
+        #[rpc(wrap, tx = NoSender)]
+        NodesSeen { ids: Vec<Id> },
+        #[rpc(wrap, tx = NoSender)]
+        NodesDead { ids: Vec<Id> },
+        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        Lookup {
+            id: Id,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        },
+        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        NetworkPut { id: Id, value: Value },
+        #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
+        NetworkGet {
+            id: Id,
+            kind: Kind,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        },
+        /// Get the routing table for testing
+        #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+        GetRoutingTable,
+        /// Get storage stats for testing
+        #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
+        GetStorageStats,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ApiClient(pub(crate) irpc::Client<ApiProto>);
+
+    impl ApiClient {
+        /// notify the node that we have just seen these nodes.
+        ///
+        /// The impl should add these nodes to the routing table.
+        pub async fn nodes_seen(&self, ids: &[Id]) -> irpc::Result<()> {
+            self.0.notify(NodesSeen { ids: ids.to_vec() }).await
+        }
+
+        /// notify the node that we have tried to contact these nodes and have not gotten a response.
+        ///
+        /// The impl can either clean these nodes from its routing table immediately or after a repeat offense.
+        pub async fn nodes_dead(&self, ids: &[Id]) -> irpc::Result<()> {
+            self.0.notify(NodesDead { ids: ids.to_vec() }).await
+        }
+
+        pub async fn get_storage_stats(&self) -> irpc::Result<BTreeMap<Id, BTreeMap<Kind, usize>>> {
+            self.0.rpc(GetStorageStats).await
+        }
+
+        pub async fn get_routing_table(&self) -> irpc::Result<Vec<Vec<NodeInfo>>> {
+            self.0.rpc(GetRoutingTable).await
+        }
+
+        pub async fn lookup(
+            &self,
+            id: Id,
+            seed: Option<NonZeroU64>,
+            n: Option<NonZeroU64>,
+        ) -> irpc::Result<irpc::channel::mpsc::Receiver<Id>> {
+            self.0.server_streaming(Lookup { id, seed, n }, 32).await
+        }
+
+        pub async fn get_immutable(&self, hash: blake3::Hash) -> irpc::Result<Option<Vec<u8>>> {
+            let id = Id::from(*hash.as_bytes());
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkGet {
+                        id,
+                        kind: Kind::Blake3Immutable,
+                        seed: None,
+                        n: Some(NonZeroU64::new(1).unwrap()),
+                    },
+                    32,
+                )
+                .await?;
+            loop {
+                match rx.recv().await {
+                    Ok(Some((_, value))) => {
+                        let Value::Blake3Immutable(Blake3Immutable { data, .. }) = value else {
+                            continue; // Skip non-Blake3Immutable values
+                        };
+                        if blake3::hash(&data) == hash {
+                            return Ok(Some(data));
+                        } else {
+                            continue; // Hash mismatch, skip this value
+                        }
+                    }
+                    Ok(None) => {
+                        break Ok(None);
+                    }
+                    Err(e) => {
+                        break Err(e.into());
+                    }
+                }
+            }
+        }
+
+        pub async fn put_immutable(&self, value: &[u8]) -> irpc::Result<(blake3::Hash, Vec<Id>)> {
+            let hash = blake3::hash(value);
+            let id = Id::from(*hash.as_bytes());
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkPut {
+                        id,
+                        value: Value::Blake3Immutable(Blake3Immutable {
+                            timestamp: now(),
+                            data: value.to_vec(),
+                        }),
+                    },
+                    32,
+                )
+                .await?;
+            let mut res = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(Some(id)) => res.push(id),
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            Ok((hash, res))
+        }
+    }
+}
+pub use api::ApiClient;
 
 mod routing {
     use std::{
@@ -466,14 +657,9 @@ mod routing {
 }
 
 use crate::{
-    api::{
-        ApiMessage, GetRoutingTable, GetStorageStats, Lookup, NetworkGet, NetworkPut, NodesDead,
-        NodesSeen,
-    },
-    proto::{
-        Blake3Immutable, FindNode, GetAll, Id, Kind, Ping, Pong, RpcMessage, RpcRequests, Set,
-        SetResponse, Value,
-    },
+    api::{ApiMessage, Lookup, NetworkGet, NetworkPut},
+    pool::{ClientPool, PoolError},
+    proto::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     routing::{ALPHA, Buckets, Distance, K, NodeInfo, RoutingTable},
 };
 
@@ -513,219 +699,53 @@ impl MemStorage {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ApiClient(irpc::Client<ApiProto>);
+pub mod pool {
+    //! An abstract pool of [`RpcClient`]s.
+    //! 
+    //! This can be implemented with an in-memory implementation for tests,
+    //! and with a proper iroh connection pool for real use.
+    use std::{collections::BTreeMap, sync::{Arc, Mutex}};
 
-impl ApiClient {
-    /// notify the node that we have just seen these nodes.
+    use snafu::Snafu;
+
+    use crate::proto::{Id, RpcClient};
+
+    /// A pool that can efficiently provide clients given a node id, and knows its
+    /// own identity.
     ///
-    /// The impl should add these nodes to the routing table.
-    pub async fn nodes_seen(&self, ids: &[Id]) -> irpc::Result<()> {
-        self.0.notify(NodesSeen { ids: ids.to_vec() }).await
-    }
+    /// For tests, this is just a map from id to client. For production, this will
+    /// wrap an iroh Endpoint and have some sort of connection cache.
+    pub trait ClientPool: Send + Sync + Clone + Sized + 'static {
+        /// Our own node id
+        fn id(&self) -> Id;
 
-    /// notify the node that we have tried to contact these nodes and have not gotten a response.
-    ///
-    /// The impl can either clean these nodes from its routing table immediately or after a repeat offense.
-    pub async fn nodes_dead(&self, ids: &[Id]) -> irpc::Result<()> {
-        self.0.notify(NodesDead { ids: ids.to_vec() }).await
-    }
-
-    pub async fn get_storage_stats(&self) -> irpc::Result<BTreeMap<Id, BTreeMap<Kind, usize>>> {
-        self.0.rpc(GetStorageStats).await
-    }
-
-    pub async fn get_routing_table(&self) -> irpc::Result<Vec<Vec<NodeInfo>>> {
-        self.0.rpc(GetRoutingTable).await
-    }
-
-    pub async fn lookup(
-        &self,
-        id: Id,
-        seed: Option<NonZeroU64>,
-        n: Option<NonZeroU64>,
-    ) -> irpc::Result<irpc::channel::mpsc::Receiver<Id>> {
-        self.0.server_streaming(Lookup { id, seed, n }, 32).await
-    }
-
-    pub async fn get_immutable(&self, hash: blake3::Hash) -> irpc::Result<Option<Vec<u8>>> {
-        let id = Id::from(*hash.as_bytes());
-        let mut rx = self
-            .0
-            .server_streaming(
-                NetworkGet {
-                    id,
-                    kind: Kind::Blake3Immutable,
-                    seed: None,
-                    n: Some(NonZeroU64::new(1).unwrap()),
-                },
-                32,
-            )
-            .await?;
-        loop {
-            match rx.recv().await {
-                Ok(Some((_, value))) => {
-                    let Value::Blake3Immutable(Blake3Immutable { data, .. }) = value else {
-                        continue; // Skip non-Blake3Immutable values
-                    };
-                    if blake3::hash(&data) == hash {
-                        return Ok(Some(data));
-                    } else {
-                        continue; // Hash mismatch, skip this value
-                    }
-                }
-                Ok(None) => {
-                    break Ok(None);
-                }
-                Err(e) => {
-                    break Err(e.into());
-                }
-            }
-        }
-    }
-
-    pub async fn put_immutable(&self, value: &[u8]) -> irpc::Result<(blake3::Hash, Vec<Id>)> {
-        let hash = blake3::hash(value);
-        let id = Id::from(*hash.as_bytes());
-        let mut rx = self
-            .0
-            .server_streaming(
-                NetworkPut {
-                    id,
-                    value: Value::Blake3Immutable(Blake3Immutable {
-                        timestamp: now(),
-                        data: value.to_vec(),
-                    }),
-                },
-                32,
-            )
-            .await?;
-        let mut res = Vec::new();
-        loop {
-            match rx.recv().await {
-                Ok(Some(id)) => res.push(id),
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        Ok((hash, res))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcClient(irpc::Client<RpcRequests>);
-
-impl RpcClient {
-    pub fn remote(endpoint: Endpoint, id: Id) -> std::result::Result<Self, SignatureError> {
-        let id = iroh::NodeId::from_bytes(&id)?;
-        let client = irpc_iroh::client(endpoint, id, proto::ALPN);
-        Ok(Self(client))
-    }
-
-    pub fn new(client: irpc::Client<RpcRequests>) -> Self {
-        Self(client)
-    }
-
-    pub async fn ping(&self) -> irpc::Result<Pong> {
-        self.0.rpc(Ping).await
-    }
-
-    pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
-        self.0.rpc(Set { key, value }).await
-    }
-
-    pub async fn get_all(
-        &self,
-        key: Id,
-        kind: Kind,
-        seed: Option<NonZeroU64>,
-        n: Option<NonZeroU64>,
-    ) -> irpc::Result<irpc::channel::mpsc::Receiver<Value>> {
-        self.0
-            .server_streaming(GetAll { key, kind, seed, n }, 32)
-            .await
-    }
-
-    pub async fn find_node(&self, id: Id) -> irpc::Result<Vec<Id>> {
-        self.0.rpc(FindNode { id }).await
-    }
-}
-
-/// A pool that can efficiently provide clients given a node id, and knows its
-/// own identity.
-///
-/// For tests, this is just a map from id to client. For production, this will
-/// wrap an iroh Endpoint and have some sort of connection cache.
-pub trait ClientPool: Send + Sync + Clone + Sized + 'static {
-    /// Our own node id
-    fn id(&self) -> Id;
-
-    /// Use the client to perform an operation.
-    ///
-    /// You must not clone the client out of the closure. If you do, this client
-    /// can become unusable at any time!
-    fn with_client<F, Fut, R, E>(&self, id: Id, f: F) -> impl Future<Output = Result<R, E>> + Send
-    where
-        F: FnOnce(RpcClient) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-        R: Send + 'static,
-        E: From<PoolError>;
-}
-
-/// Error when a pool can not obtain a client.
-#[derive(Debug, Snafu)]
-pub struct PoolError {
-    message: &'static str,
-}
-
-pub mod api {
-    //! RPC protocol for an user to talk to a DHT node.
-    //!
-    //! These are operations that affect the entire network, such as storing or retrieving a value.
-    use std::{collections::BTreeMap, num::NonZeroU64};
-
-    use irpc::{
-        channel::{mpsc, none::NoSender, oneshot},
-        rpc_requests,
-    };
-    use serde::{Deserialize, Serialize};
-
-    use crate::{
-        proto::{Id, Kind, Value},
-        routing::NodeInfo,
-    };
-
-    #[rpc_requests(message = ApiMessage)]
-    #[derive(Debug, Serialize, Deserialize)]
-    pub enum ApiProto {
-        #[rpc(wrap, tx = NoSender)]
-        NodesSeen { ids: Vec<Id> },
-        #[rpc(wrap, tx = NoSender)]
-        NodesDead { ids: Vec<Id> },
-        #[rpc(wrap, tx = mpsc::Sender<Id>)]
-        Lookup {
+        /// Use the client to perform an operation.
+        ///
+        /// You must not clone the client out of the closure. If you do, this client
+        /// can become unusable at any time!
+        fn with_client<F, Fut, R, E>(
+            &self,
             id: Id,
-            seed: Option<NonZeroU64>,
-            n: Option<NonZeroU64>,
-        },
-        #[rpc(wrap, tx = mpsc::Sender<Id>)]
-        NetworkPut { id: Id, value: Value },
-        #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
-        NetworkGet {
-            id: Id,
-            kind: Kind,
-            seed: Option<NonZeroU64>,
-            n: Option<NonZeroU64>,
-        },
-        /// Get the routing table for testing
-        #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
-        GetRoutingTable,
-        /// Get storage stats for testing
-        #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
-        GetStorageStats,
+            f: F,
+        ) -> impl Future<Output = Result<R, E>> + Send
+        where
+            F: FnOnce(RpcClient) -> Fut + Send + 'static,
+            Fut: Future<Output = Result<R, E>> + Send + 'static,
+            R: Send + 'static,
+            E: From<PoolError>;
+    }
+
+    /// Error when a pool can not obtain a client.
+    #[derive(Debug, Snafu)]
+    pub struct PoolError {
+        pub message: &'static str,
+    }
+
+    struct IrohPoolActor {
+        endpoint: iroh::Endpoint,
+        connections: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
     }
 }
-use api::ApiProto;
 
 /// State of the actor that is required in the async handlers
 #[derive(Debug, Clone)]
@@ -937,9 +957,10 @@ where
                     let indices = sample(&mut rng, values.len(), n);
                     for i in indices {
                         if let Some(value) = values.get_index(i)
-                            && msg.tx.send(value.clone()).await.is_err() {
-                                break;
-                            }
+                            && msg.tx.send(value.clone()).await.is_err()
+                        {
+                            break;
+                        }
                     }
                 } else {
                     // just send them in whatever order they return from the store.
@@ -949,10 +970,6 @@ where
                         }
                     }
                 }
-            }
-            RpcMessage::Ping(msg) => {
-                // just respond with pong.
-                msg.tx.send(Pong).await.ok();
             }
             RpcMessage::FindNode(msg) => {
                 // call local find_node and just return the results
@@ -1025,11 +1042,7 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
-    async fn query_one(
-        &self,
-        id: Id,
-        target: Id,
-    ) -> Result<Vec<Id>, &'static str> {
+    async fn query_one(&self, id: Id, target: Id) -> Result<Vec<Id>, &'static str> {
         let ids = self
             .pool
             .with_client(id, move |client| async move {
@@ -1041,11 +1054,7 @@ impl<P: ClientPool> State<P> {
         Ok(ids)
     }
 
-    async fn iterative_find_node(
-        self,
-        target: Id,
-        initial: Vec<Id>,
-    ) -> Vec<Id> {
+    async fn iterative_find_node(self, target: Id, initial: Vec<Id>) -> Vec<Id> {
         let mut candidates = initial
             .into_iter()
             .filter(|id| *id != self.pool.id())
