@@ -21,3 +21,10 @@ snafu = "0.8.6"
 textplots = "0.8.7"
 tokio = "1.47.1"
 tracing = "0.1.41"
+iroh-connection-pool = { git = "https://github.com/n0-computer/iroh-experiments", branch = "handler-pool" }
+
+[patch.crates-io]
+iroh = { git = "https://github.com/n0-computer/iroh", branch = "connection-speed-test" }
+
+[dev-dependencies]
+testresult = "0.4.1"

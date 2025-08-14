@@ -1,5 +1,16 @@
 //! # Minimal DHT for iroh
 //!
+//! This follows a lot of the design decisions of the bittorrent mainline DHT,
+//! with two major differences:
+//! - we use BLAKE3 instead of SHA1, and therefore extend the keyspace to 32
+//!   bytes. 32 bytes is also a more natural fit for other purposes such as
+//!   storage of data for ED25519 keys like in [bep_0044]
+//! - connections are not raw UDP but iroh connections, with use of 0rtt to make
+//!   the DHT typical tiny interactions faster.
+//!
+//! Other than that this is a pretty straightforward [kademlia] implementation,
+//! using the XOR metric and standard routing tables.
+//!
 //! A DHT is two things:
 //!
 //! ## Data storage
@@ -21,7 +32,8 @@
 //!
 //! - Provider node ids for a key, where the key is interpreted as a BLAKE3 hash
 //!   of some data. Expiry is a timestamp, validation is checking that the node
-//!   has the data by means of a BLAKE3 probe.
+//!   has the data by means of a BLAKE3 probe. This is equivalent to the main
+//!   purpose of mainline outlined in [bep_0005].
 //!
 //! - A signed message, e.g. a pkarr record, where the key is interpreted as
 //!   the public key of the signer. Expiry is a timestamp, validation is
@@ -37,6 +49,16 @@
 //!
 //! A way to find the n most natural locations for a given key. Routing is only
 //! concerned with the key, not the value.
+//!
+//! - [bep_0044]: https://www.bittorrent.org/beps/bep_0044.html
+//! - [bep_0005]: https://www.bittorrent.org/beps/bep_0005.html
+//! - [kademlia]: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
+//!
+//! DHT nodes talk to each other using a simple [rpc] protocol. RPC requests can
+//! always be answered using purely local information.
+//!
+//! A DHT node is controlled using the [api] protocol, which contains higher
+//! level operations that trigger interactions with multiple DHT nodes.
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     time::UNIX_EPOCH,
@@ -51,7 +73,7 @@ use snafu::Snafu;
 use tokio::task::JoinSet;
 #[cfg(test)]
 mod tests;
-pub mod proto {
+pub mod rpc {
     //! RPC protocol between DHT nodes.
     //!
     //! These are low level operations that only affect the node being called.
@@ -65,7 +87,7 @@ pub mod proto {
     //! The entry point is [`RpcClient`].
     use std::{fmt, num::NonZeroU64, ops::Deref};
 
-    use iroh::Endpoint;
+    use iroh::{Endpoint, PublicKey};
     use iroh_base::SignatureError;
     use irpc::{
         channel::{mpsc, oneshot},
@@ -171,6 +193,12 @@ pub mod proto {
         }
     }
 
+    impl From<PublicKey> for Id {
+        fn from(pk: PublicKey) -> Self {
+            Id(*pk.as_bytes())
+        }
+    }
+
     impl Id {
         pub fn blake3_hash(data: &[u8]) -> Self {
             let hash = blake3::hash(data);
@@ -232,6 +260,8 @@ pub mod proto {
     pub struct FindNode {
         /// The key to find the most natural locations (nodes) for.
         pub id: Id,
+        /// The requester wants to be included in the routing table.
+        pub requester: Option<Id>,
     }
 
     /// Protocol for rpc communication.
@@ -284,8 +314,8 @@ pub mod proto {
                 .await
         }
 
-        pub async fn find_node(&self, id: Id) -> irpc::Result<Vec<Id>> {
-            self.0.rpc(FindNode { id }).await
+        pub async fn find_node(&self, id: Id, requester: Option<Id>) -> irpc::Result<Vec<Id>> {
+            self.0.rpc(FindNode { id, requester }).await
         }
     }
 }
@@ -309,8 +339,8 @@ pub mod api {
 
     use crate::{
         now,
-        proto::{Blake3Immutable, Id, Kind, Value},
         routing::NodeInfo,
+        rpc::{Blake3Immutable, Id, Kind, Value},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -443,6 +473,7 @@ pub mod api {
     }
 }
 pub use api::ApiClient;
+use tracing::error;
 
 mod routing {
     use std::{
@@ -453,7 +484,7 @@ mod routing {
     use arrayvec::ArrayVec;
     use serde::{Deserialize, Serialize};
 
-    use super::proto::Id;
+    use super::rpc::Id;
 
     pub const K: usize = 20; // Bucket size
     pub const ALPHA: usize = 3; // Concurrency parameter
@@ -659,8 +690,8 @@ mod routing {
 use crate::{
     api::{ApiMessage, Lookup, NetworkGet, NetworkPut},
     pool::{ClientPool, PoolError},
-    proto::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     routing::{ALPHA, Buckets, Distance, K, NodeInfo, RoutingTable},
+    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
 };
 
 struct Node {
@@ -701,14 +732,18 @@ impl MemStorage {
 
 pub mod pool {
     //! An abstract pool of [`RpcClient`]s.
-    //! 
+    //!
     //! This can be implemented with an in-memory implementation for tests,
     //! and with a proper iroh connection pool for real use.
-    use std::{collections::BTreeMap, sync::{Arc, Mutex}};
-
+    use iroh::{
+        PublicKey,
+        endpoint::{Connection, RecvStream, SendStream},
+    };
+    use iroh_connection_pool::connection_pool::ConnectionPool;
     use snafu::Snafu;
+    use tracing::trace;
 
-    use crate::proto::{Id, RpcClient};
+    use crate::rpc::{Id, RpcClient};
 
     /// A pool that can efficiently provide clients given a node id, and knows its
     /// own identity.
@@ -732,18 +767,77 @@ pub mod pool {
             F: FnOnce(RpcClient) -> Fut + Send + 'static,
             Fut: Future<Output = Result<R, E>> + Send + 'static,
             R: Send + 'static,
-            E: From<PoolError>;
+            E: From<PoolError> + Send + 'static;
     }
 
     /// Error when a pool can not obtain a client.
     #[derive(Debug, Snafu)]
     pub struct PoolError {
-        pub message: &'static str,
+        pub message: String,
     }
 
-    struct IrohPoolActor {
-        endpoint: iroh::Endpoint,
-        connections: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
+    #[derive(Debug, Clone)]
+    pub struct IrohPool {
+        id: PublicKey,
+        inner: ConnectionPool,
+    }
+
+    impl IrohPool {
+        pub fn new(id: PublicKey, inner: ConnectionPool) -> Self {
+            Self { id, inner }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct IrohConnection(Connection);
+
+    impl irpc::rpc::RemoteConnection for IrohConnection {
+        fn clone_boxed(&self) -> Box<dyn irpc::rpc::RemoteConnection> {
+            Box::new(self.clone())
+        }
+
+        fn open_bi(
+            &self,
+        ) -> n0_future::future::Boxed<
+            std::result::Result<(SendStream, RecvStream), irpc::RequestError>,
+        > {
+            let conn = self.0.clone();
+            Box::pin(async move {
+                let (send, recv) = conn.open_bi().await?;
+                Ok((send, recv))
+            })
+        }
+    }
+
+    impl ClientPool for IrohPool {
+        fn id(&self) -> Id {
+            Id::node_id(self.id)
+        }
+
+        async fn with_client<F, Fut, R, E>(&self, id: Id, f: F) -> Result<R, E>
+        where
+            F: FnOnce(RpcClient) -> Fut + Send + 'static,
+            Fut: Future<Output = Result<R, E>> + Send + 'static,
+            R: Send + 'static,
+            E: From<PoolError> + Send + 'static,
+        {
+            let node_id = PublicKey::from_bytes(&id).unwrap();
+            trace!(%node_id, "Connecting");
+            let res = self
+                .inner
+                .with_connection(node_id, move |conn| async move {
+                    trace!(%node_id, "Got connection");
+                    let client = RpcClient(irpc::Client::boxed(IrohConnection(conn)));
+                    f(client).await
+                })
+                .await;
+            res.map_err(|_| PoolError {
+                message: "Connection pool shut down".into(),
+            })?
+            .map_err(|e| PoolError {
+                message: format!("Failed to obtain client: {}", e),
+            })?
+        }
     }
 }
 
@@ -756,6 +850,8 @@ struct State<P> {
     pool: P,
     /// configuration
     config: Config,
+    /// candidates for inclusion in the routing table
+    candidates: IndexSet<Id>,
 }
 
 struct Actor<P> {
@@ -771,8 +867,11 @@ struct Actor<P> {
 }
 
 /// Dht lookup config
+///
+/// Note that while transient, parallelism and alpha are parameters that you can
+/// modify to suit your needs, you very rarely want to modify the k parameter.
 #[derive(Debug, Clone, Copy)]
-struct Config {
+pub struct Config {
     /// DHT parameter K
     k: usize,
     /// DHT parameter ALPHA
@@ -780,6 +879,28 @@ struct Config {
     /// Parallelism for the set or getall requests once we have found the k
     /// closest nodes.
     parallelism: usize,
+    /// Whether the requester is a transient node.
+    transient: bool,
+}
+
+impl Config {
+    /// Configuration for a transient node that does not want to be included
+    /// in the routing tables of its peers.
+    pub fn transient() -> Self {
+        Self {
+            transient: true,
+            ..Default::default()
+        }
+    }
+
+    /// Configuration for a persistent node that wants to be included
+    /// in the routing tables of its peers.
+    pub fn persistent() -> Self {
+        Self {
+            transient: false,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for Config {
@@ -788,6 +909,7 @@ impl Default for Config {
             k: K,
             alpha: ALPHA,
             parallelism: 4,
+            transient: true,
         }
     }
 }
@@ -812,7 +934,12 @@ impl<P> Actor<P>
 where
     P: ClientPool,
 {
-    fn new(node: Node, rx: tokio::sync::mpsc::Receiver<RpcMessage>, pool: P) -> (Self, ApiClient) {
+    fn new(
+        node: Node,
+        rx: tokio::sync::mpsc::Receiver<RpcMessage>,
+        pool: P,
+        config: Config,
+    ) -> (Self, ApiClient) {
         let (api_tx, internal_rx) = tokio::sync::mpsc::channel(32);
         let api = ApiClient(api_tx.into());
         (
@@ -824,7 +951,8 @@ where
                 state: State {
                     api: api.clone(),
                     pool,
-                    config: Config::default(),
+                    config,
+                    candidates: IndexSet::new(),
                 },
             },
             api,
@@ -850,7 +978,7 @@ where
                 }
                 Some(res) = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     if let Err(e) = res {
-                        tracing::error!("Task failed: {:?}", e);
+                        error!("Task failed: {:?}", e);
                     }
                 }
             }
@@ -977,6 +1105,9 @@ where
                     .node
                     .routing_table
                     .find_closest_nodes(&msg.id, self.state.config.k);
+                if let Some(requester) = msg.requester {
+                    self.state.candidates.insert(requester);
+                }
                 msg.tx.send(ids).await.ok();
             }
         }
@@ -1043,10 +1174,15 @@ impl<P: ClientPool> State<P> {
     }
 
     async fn query_one(&self, id: Id, target: Id) -> Result<Vec<Id>, &'static str> {
+        let requester = if self.config.transient {
+            None
+        } else {
+            Some(self.pool.id())
+        };
         let ids = self
             .pool
             .with_client(id, move |client| async move {
-                let ids = client.find_node(target).await?;
+                let ids = client.find_node(target, requester).await?;
                 std::result::Result::<Vec<Id>, Error>::Ok(ids)
             })
             .await
@@ -1124,8 +1260,13 @@ fn now() -> u64 {
 }
 
 /// Creates a DHT node
-pub fn create_node<P: ClientPool>(id: Id, pool: P, bootstrap: Vec<Id>) -> (RpcClient, ApiClient) {
-    create_node_impl(id, pool, bootstrap, None)
+pub fn create_node<P: ClientPool>(
+    id: Id,
+    pool: P,
+    bootstrap: Vec<Id>,
+    config: Config,
+) -> (RpcClient, ApiClient) {
+    create_node_impl(id, pool, bootstrap, None, config)
 }
 
 /// Create a node, given an id, a set of bootstrap nodes, a
@@ -1134,6 +1275,7 @@ fn create_node_impl<P: ClientPool>(
     pool: P,
     bootstrap: Vec<Id>,
     buckets: Option<Box<Buckets>>,
+    config: Config,
 ) -> (RpcClient, ApiClient) {
     let mut node = Node {
         id,
@@ -1149,7 +1291,7 @@ fn create_node_impl<P: ClientPool>(
         }
     }
     let (tx, rx) = tokio::sync::mpsc::channel(32);
-    let (actor, api) = Actor::<P>::new(node, rx, pool);
+    let (actor, api) = Actor::<P>::new(node, rx, pool, config);
     tokio::spawn(actor.run());
     (RpcClient(irpc::Client::local(tx)), api)
 }

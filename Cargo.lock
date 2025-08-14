@@ -601,7 +601,8 @@ dependencies = [
  "hex",
  "indexmap",
  "iroh",
- "iroh-base",
+ "iroh-base 0.91.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "iroh-connection-pool",
  "irpc",
  "irpc-iroh",
  "n0-future 0.2.0",
@@ -609,6 +610,7 @@ dependencies = [
  "serde",
  "serde-big-array",
  "snafu",
+ "testresult",
  "textplots",
  "tokio",
  "tracing",
@@ -1459,8 +1461,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.91.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6a98c47bb5f720edeb77be502a8acd238a3c0755f0b1ad865a716224d794a59"
+source = "git+https://github.com/n0-computer/iroh?branch=connection-speed-test#0248015cb663bc1b90faa4a6390b5e9aa2a5ef3f"
 dependencies = [
  "aead",
  "backon",
@@ -1478,7 +1479,7 @@ dependencies = [
  "http",
  "igd-next",
  "instant",
- "iroh-base",
+ "iroh-base 0.91.1 (git+https://github.com/n0-computer/iroh?branch=connection-speed-test)",
  "iroh-metrics",
  "iroh-quinn",
  "iroh-quinn-proto",
@@ -1534,6 +1535,36 @@ dependencies = [
  "serde",
  "snafu",
  "url",
+]
+
+[[package]]
+name = "iroh-base"
+version = "0.91.1"
+source = "git+https://github.com/n0-computer/iroh?branch=connection-speed-test#fe902c9c39f8e22a4e13e722475c0c9b4f204fce"
+dependencies = [
+ "curve25519-dalek",
+ "data-encoding",
+ "derive_more 2.0.1",
+ "ed25519-dalek",
+ "n0-snafu",
+ "nested_enum_utils",
+ "rand_core 0.6.4",
+ "serde",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "iroh-connection-pool"
+version = "0.1.0"
+source = "git+https://github.com/n0-computer/iroh-experiments?branch=handler-pool#2ba54259497187ef8d7e6a4488882045e1366ee1"
+dependencies = [
+ "iroh",
+ "n0-future 0.2.0",
+ "snafu",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1619,8 +1650,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.91.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f19e43de2cfc04748054e1cbf7854ae1e192ddc45a4adeae7be7076a8f1fd43"
+source = "git+https://github.com/n0-computer/iroh?branch=connection-speed-test#fe902c9c39f8e22a4e13e722475c0c9b4f204fce"
 dependencies = [
  "blake3",
  "bytes",
@@ -1633,7 +1663,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "iroh-base",
+ "iroh-base 0.91.1 (git+https://github.com/n0-computer/iroh?branch=connection-speed-test)",
  "iroh-metrics",
  "iroh-quinn",
  "iroh-quinn-proto",
@@ -3316,6 +3346,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "testresult"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "614b328ff036a4ef882c61570f72918f7e9c5bee1da33f8e7f91e01daee7e56c"
+
+[[package]]
 name = "textplots"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3482,6 +3518,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 

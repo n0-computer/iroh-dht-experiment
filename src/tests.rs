@@ -1,13 +1,23 @@
+//! In memory integration style tests
+//!
+//! These are long running tests that spawn a lot of nodes and observe the
+//! behaviour of an entire swarm. Most tests use in-memory nodes.
 use std::{
     num::NonZeroU64,
     sync::{Arc, Mutex},
 };
 
+use iroh::{
+    Endpoint, NodeAddr, SecretKey, Watcher, discovery::static_provider::StaticProvider,
+    endpoint::BindError, protocol::Router,
+};
+use iroh_connection_pool::connection_pool::ConnectionPool;
 use rand::{Rng, rngs::StdRng, seq::SliceRandom};
+use testresult::TestResult;
 use textplots::{Chart, Plot, Shape};
 
 use super::*;
-use crate::proto::Blake3Immutable;
+use crate::{pool::IrohPool, rpc::Blake3Immutable};
 
 #[derive(Debug, Clone)]
 struct TestPool {
@@ -30,7 +40,7 @@ impl ClientPool for TestPool {
             .get(&id)
             .cloned()
             .ok_or(E::from(PoolError {
-                message: "client not found",
+                message: "client not found".into(),
             }))?;
         f(client).await
     }
@@ -83,7 +93,10 @@ async fn create_nodes(ids: &[Id], mut n_bootstrap: usize, buckets: Option<Box<Bu
             let bootstrap = (0..n_bootstrap)
                 .map(|i| ids[(offfset + i + 1) % n])
                 .collect::<Vec<_>>();
-            (*id, create_node_impl(*id, pool, bootstrap, buckets.clone()))
+            (
+                *id,
+                create_node_impl(*id, pool, bootstrap, buckets.clone(), Default::default()),
+            )
         })
         .collect::<Vec<_>>();
     clients
@@ -357,4 +370,100 @@ async fn random_lookup_1k() {
     for lookups in 0..10 {
         random_lookup_test(1000, 0, lookups).await;
     }
+}
+
+const DHT_TEST_ALPN: &[u8] = b"iroh/dht/0";
+
+type IrohNodes = Vec<(Endpoint, (RpcClient, ApiClient))>;
+
+/// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
+///
+/// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
+///
+/// These will be full iroh nodes with static discovery configured in such a way that they can find each other without bothering
+/// the discovery service!
+async fn iroh_create_nodes(
+    secrets: &[SecretKey],
+    mut n_bootstrap: usize,
+    buckets: Option<Box<Buckets>>,
+) -> std::result::Result<IrohNodes, BindError> {
+    let n = secrets.len();
+    let publics = secrets.iter().map(|s| s.public()).collect::<Vec<_>>();
+    let ids = Arc::new(publics.iter().map(|p| Id::from(*p)).collect::<Vec<_>>());
+    let buckets = Arc::new(buckets);
+    let discovery = StaticProvider::new();
+    n_bootstrap = n_bootstrap.min(n - 1);
+    // create n nodes
+    stream::iter(secrets.iter().zip(publics.iter()).enumerate())
+        .map(|(offfset, (secret, public))| {
+            let buckets = buckets.clone();
+            let ids = ids.clone();
+            let discovery = discovery.clone();
+            async move {
+                let endpoint = Endpoint::builder()
+                    .secret_key(secret.clone())
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .discovery(discovery.clone())
+                    .bind()
+                    .await?;
+                let addr = endpoint.node_addr().initialized().await;
+                discovery.add_node_info(addr.clone());
+                let pool = ConnectionPool::new(endpoint.clone(), DHT_TEST_ALPN, Default::default());
+                let pool = IrohPool::new(*public, pool);
+                let bootstrap = (0..n_bootstrap)
+                    .map(|i| ids[(offfset + i + 1) % n])
+                    .collect::<Vec<_>>();
+                let id = Id::from(*public);
+                Ok((
+                    endpoint,
+                    create_node_impl(id, pool, bootstrap, (*buckets).clone(), Default::default()),
+                ))
+            }
+        })
+        .buffered_unordered(32)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
+}
+
+fn create_secrets(seed: u64, n: usize) -> Vec<SecretKey> {
+    let mut rng = rng(seed);
+    (0..n)
+        .map(|_| SecretKey::from_bytes(&rng.r#gen::<[u8; 32]>()))
+        .collect()
+}
+
+fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
+    iroh_nodes
+        .iter()
+        .map(|(endpoint, (rpc, _))| {
+            let sender = rpc.0.as_local().unwrap();
+            Router::builder(endpoint.clone())
+                .accept(DHT_TEST_ALPN, irpc_iroh::IrohProtocol::with_sender(sender))
+                .spawn()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn iroh_perfect_routing_tables_1k() -> TestResult<()> {
+    let n = 500;
+    let seed = 0;
+    let bootstrap = 0;
+    let secrets = create_secrets(seed, n);
+    println!("Creating {} nodes", n);
+    let iroh_nodes = iroh_create_nodes(&secrets, bootstrap, None).await?;
+    let nodes = iroh_nodes
+        .iter()
+        .map(|(ep, x)| (Id::from(ep.node_id()), x.clone()))
+        .collect::<Vec<_>>();
+    let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    println!("Initializing routing tables");
+    init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
+    println!("Spawning {} routers", n);
+    let _routers = spawn_routers(&iroh_nodes);
+    println!("Storing random values");
+    store_random_values(&nodes, 1).await.ok();
+    Ok(())
 }
