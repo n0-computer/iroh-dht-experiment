@@ -252,7 +252,7 @@ fn create_buckets(ids: &[Id]) -> Box<Buckets> {
 }
 
 #[tokio::test]
-async fn no_routing() {
+async fn no_routing_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 0;

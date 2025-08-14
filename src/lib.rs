@@ -5,7 +5,7 @@
 //! - we use BLAKE3 instead of SHA1, and therefore extend the keyspace to 32
 //!   bytes. 32 bytes is also a more natural fit for other purposes such as
 //!   storage of data for ED25519 keys like in [bep_0044]
-//! - connections are not raw UDP but iroh connections, with use of 0rtt to make
+//! - connections are not raw UDP but iroh connections, with use of [0rtt] to make
 //!   the DHT typical tiny interactions faster.
 //!
 //! Other than that this is a pretty straightforward [kademlia] implementation,
@@ -57,10 +57,16 @@
 //! A DHT node is controlled using the [api] protocol, which contains higher
 //! level operations that trigger interactions with multiple DHT nodes.
 //! 
+//! Both protocols are implemented using the [irpc] crate. As an intro to irpc,
+//! see the [irpc blog post].
+//! 
 //! [bep_0044]: https://www.bittorrent.org/beps/bep_0044.html
 //! [bep_0005]: https://www.bittorrent.org/beps/bep_0005.html
 //! [kademlia]: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
 //! [postcard]: https://postcard.jamesmunns.com/
+//! [0rtt]: https://www.iroh.computer/blog/0rtt-api
+//! [irpc]: https://docs.rs/irpc/latest/irpc/
+//! [irpc blog post]: https://www.iroh.computer/blog/irpc/
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     time::UNIX_EPOCH,
@@ -1067,7 +1073,7 @@ where
                 let self_dist = Distance::between(&self.node.id, &msg.key);
                 if ids
                     .iter()
-                    .all(|id| Distance::between(&self.node.id, id) < self_dist)
+                    .all(|id| Distance::between(&self.node.id, id) < self_dist) && ids.len() >= self.state.config.k
                 {
                     msg.tx.send(SetResponse::ErrDistance).await.ok();
                     return;
