@@ -37,28 +37,30 @@
 //!
 //! - A signed message, e.g. a pkarr record, where the key is interpreted as
 //!   the public key of the signer. Expiry is a timestamp, validation is
-//!   checking the signature against the public key.
+//!   checking the signature against the public key. Almost identical to [bep_0044],
+//!   except that we don't have to hash the key because it fits our keyspace.
 //!
 //! - Self-contained immutable data, where the key is interpreted as a BLAKE3
 //!   hash of the data. Expiry is a timestamp, validation is checking that the
-//!   data matches the hash.
+//!   data matches the hash. This is also part of [bep_0044].
 //!
-//! Data storage will use postcard on the wire and most likely also on disk.
+//! We use [postcard] on the wire and most likely also on disk.
 //!
 //! ## Routing
 //!
 //! A way to find the n most natural locations for a given key. Routing is only
 //! concerned with the key, not the value.
 //!
-//! - [bep_0044]: https://www.bittorrent.org/beps/bep_0044.html
-//! - [bep_0005]: https://www.bittorrent.org/beps/bep_0005.html
-//! - [kademlia]: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
-//!
 //! DHT nodes talk to each other using a simple [rpc] protocol. RPC requests can
 //! always be answered using purely local information.
 //!
 //! A DHT node is controlled using the [api] protocol, which contains higher
 //! level operations that trigger interactions with multiple DHT nodes.
+//! 
+//! [bep_0044]: https://www.bittorrent.org/beps/bep_0044.html
+//! [bep_0005]: https://www.bittorrent.org/beps/bep_0005.html
+//! [kademlia]: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
+//! [postcard]: https://postcard.jamesmunns.com/
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     time::UNIX_EPOCH,

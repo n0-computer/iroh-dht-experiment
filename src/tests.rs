@@ -8,7 +8,7 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, NodeAddr, SecretKey, Watcher, discovery::static_provider::StaticProvider,
+    Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider,
     endpoint::BindError, protocol::Router,
 };
 use iroh_connection_pool::connection_pool::ConnectionPool;
@@ -447,7 +447,7 @@ fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
 }
 
 #[tokio::test]
-async fn iroh_perfect_routing_tables_1k() -> TestResult<()> {
+async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
     let n = 500;
     let seed = 0;
     let bootstrap = 0;
@@ -464,6 +464,6 @@ async fn iroh_perfect_routing_tables_1k() -> TestResult<()> {
     println!("Spawning {} routers", n);
     let _routers = spawn_routers(&iroh_nodes);
     println!("Storing random values");
-    store_random_values(&nodes, 1).await.ok();
+    store_random_values(&nodes, 100).await.ok();
     Ok(())
 }
