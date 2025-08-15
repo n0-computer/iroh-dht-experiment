@@ -68,16 +68,17 @@
 //! [irpc]: https://docs.rs/irpc/latest/irpc/
 //! [irpc blog post]: https://www.iroh.computer/blog/irpc/
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    time::UNIX_EPOCH,
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use futures_buffered::FuturesUnordered;
 use indexmap::IndexSet;
 use iroh::NodeId;
-use irpc::channel::mpsc;
-use n0_future::{BufferedStreamExt, StreamExt, stream};
-use rand::{SeedableRng, seq::index::sample};
+use irpc::channel::{mpsc, oneshot};
+use n0_future::{BufferedStreamExt, MaybeFuture, StreamExt, stream};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::index::sample};
+use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use tokio::task::JoinSet;
 #[cfg(test)]
@@ -277,7 +278,7 @@ pub mod rpc {
         pub id: Id,
         /// The requester wants to be included in the routing table.
         ///
-        /// For the irpc memory transport, you have to just believe this value.
+        /// For the irpc memory or quinn transport, you have to just believe this value.
         /// For the irpc iroh transport, this must be the node ID of the requester.
         pub requester: Option<NodeId>,
     }
@@ -351,7 +352,7 @@ pub mod api {
     //! message type [`ApiMessage`].
     //!
     //! The entry point is [`ApiClient`].
-    use std::{collections::BTreeMap, num::NonZeroU64};
+    use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
     use iroh::NodeId;
     use irpc::{
@@ -377,11 +378,10 @@ pub mod api {
         /// to provide AddrInfo here since the routing table does not store it.
         #[rpc(wrap, tx = NoSender)]
         NodesDead { ids: Vec<NodeId> },
-        #[rpc(wrap, tx = mpsc::Sender<NodeId>)]
+        #[rpc(wrap, tx = oneshot::Sender<Vec<NodeId>>)]
         Lookup {
+            initial: Option<Vec<NodeId>>,
             id: Id,
-            seed: Option<NonZeroU64>,
-            n: Option<NonZeroU64>,
         },
         #[rpc(wrap, tx = mpsc::Sender<NodeId>)]
         NetworkPut { id: Id, value: Value },
@@ -398,6 +398,15 @@ pub mod api {
         /// Get storage stats for testing
         #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
         GetStorageStats,
+        /// Perform a self lookup
+        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        SelfLookup,
+        /// Perform a random lookup
+        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        RandomLookup,
+        /// Perform a candidate lookup
+        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        CandidateLookup,
     }
 
     #[derive(Debug, Clone)]
@@ -429,10 +438,9 @@ pub mod api {
         pub async fn lookup(
             &self,
             id: Id,
-            seed: Option<NonZeroU64>,
-            n: Option<NonZeroU64>,
-        ) -> irpc::Result<irpc::channel::mpsc::Receiver<NodeId>> {
-            self.0.server_streaming(Lookup { id, seed, n }, 32).await
+            initial: Option<Vec<NodeId>>,
+        ) -> irpc::Result<Vec<NodeId>> {
+            self.0.rpc(Lookup { id, initial }).await
         }
 
         pub async fn get_immutable(&self, hash: blake3::Hash) -> irpc::Result<Option<Vec<u8>>> {
@@ -500,10 +508,43 @@ pub mod api {
             }
             Ok((hash, res))
         }
+
+        pub async fn self_lookup(&self) {
+            self.0.rpc(SelfLookup).await.ok();
+        }
+
+        pub(crate) async fn self_lookup_periodic(self, interval: Duration) {
+            loop {
+                tokio::time::sleep(interval).await;
+                self.self_lookup().await;
+            }
+        }
+
+        pub async fn random_lookup(&self) {
+            self.0.rpc(RandomLookup).await.ok();
+        }
+
+        pub(crate) async fn random_lookup_periodic(self, interval: Duration) {
+            loop {
+                tokio::time::sleep(interval).await;
+                self.random_lookup().await;
+            }
+        }
+
+        pub async fn candidate_lookup(&self) {
+            self.0.rpc(CandidateLookup).await.ok();
+        }
+
+        pub(crate) async fn candidate_lookup_periodic(self, interval: Duration) {
+            loop {
+                self.candidate_lookup().await;
+                tokio::time::sleep(interval).await;
+            }
+        }
     }
 }
 pub use api::ApiClient;
-use tracing::error;
+use tracing::{error, warn};
 
 mod routing {
     use std::{
@@ -678,6 +719,14 @@ mod routing {
             }
         }
 
+        pub(crate) fn contains(&self, id: &NodeId) -> bool {
+            let bucket_idx = self.bucket_index(id.as_bytes());
+            self.buckets[bucket_idx]
+                .nodes()
+                .iter()
+                .any(|node| node.id == *id)
+        }
+
         pub(crate) fn add_node(&mut self, node: NodeInfo) -> bool {
             if node.id == self.local_id {
                 return false;
@@ -772,7 +821,6 @@ pub mod pool {
     //!
     //! This can be implemented with an in-memory implementation for tests,
     //! and with a proper iroh connection pool for real use.
-    use std::collections::BTreeSet;
 
     use iroh::{
         Endpoint, NodeAddr, NodeId,
@@ -797,12 +845,13 @@ pub mod pool {
         ///
         /// The default impl doesn't add anything.
         fn node_addr(&self, node_id: NodeId) -> NodeAddr {
-            NodeAddr {
-                node_id,
-                relay_url: None,
-                direct_addresses: BTreeSet::new(),
-            }
+            node_id.into()
         }
+
+        /// Adds dialing info for a node id.
+        ///
+        /// The default impl doesn't add anything.
+        fn add_node_addr(&self, _addr: NodeAddr) {}
 
         /// Use the client to perform an operation.
         ///
@@ -876,6 +925,20 @@ pub mod pool {
             }
         }
 
+        fn add_node_addr(&self, addr: NodeAddr) {
+            // don't add self info.
+            // this should not happen, but just in case
+            if addr.node_id == self.id() {
+                return;
+            }
+            // don't add useless info.
+            if addr.relay_url.is_none() && addr.direct_addresses.is_empty() {
+                return;
+            }
+            // this can still fail, for the reason AddNodeAddrError::EmptyPruned ¯\_(ツ)_/¯
+            self.endpoint.add_node_addr_with_source(addr, "").ok();
+        }
+
         async fn with_client<F, Fut, R, E>(&self, node_id: NodeId, f: F) -> Result<R, E>
         where
             F: FnOnce(RpcClient) -> Fut + Send + 'static,
@@ -911,10 +974,36 @@ struct State<P> {
     pool: P,
     /// configuration
     config: Config,
-    /// candidates for inclusion in the routing table
-    ///
-    /// todo! actually use them!
-    candidates: IndexSet<NodeId>,
+}
+
+struct Candidates {
+    ids: VecDeque<NodeId>,
+    max_size: usize,
+}
+
+impl Candidates {
+    fn new(max_size: usize) -> Self {
+        Self {
+            ids: VecDeque::new(),
+            max_size,
+        }
+    }
+
+    /// Adds a candidate, dedups, and maintains the max size.
+    fn add(&mut self, id: NodeId) {
+        self.ids.retain(|x| x != &id);
+        self.ids.push_front(id);
+        while self.ids.len() > self.max_size {
+            self.ids.pop_back();
+        }
+    }
+
+    /// Returns the candidates, most recent first, and clears the set
+    fn clear_and_take(&mut self) -> Vec<NodeId> {
+        let res = self.ids.iter().cloned().collect();
+        self.ids.clear();
+        res
+    }
 }
 
 struct Actor<P> {
@@ -927,13 +1016,17 @@ struct Actor<P> {
     tasks: JoinSet<()>,
     /// state
     state: State<P>,
+    /// candidates for inclusion in the routing table
+    candidates: Option<Candidates>,
+    /// Rng for random lookups
+    rng: rand::rngs::StdRng,
 }
 
 /// Dht lookup config
 ///
 /// Note that while transient, parallelism and alpha are parameters that you can
 /// modify to suit your needs, you very rarely want to modify the k parameter.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     /// DHT parameter K
     k: usize,
@@ -944,6 +1037,38 @@ pub struct Config {
     parallelism: usize,
     /// Whether the requester is a transient node.
     transient: bool,
+    /// Random lookup strategy.
+    random_lookup_strategy: Option<RandomLookupStrategy>,
+    /// Self lookup strategy.
+    self_lookup_strategy: Option<SelfLookupStrategy>,
+    /// Candidate lookup strategy.
+    candidate_lookup_strategy: Option<CandidateLookupStrategy>,
+    /// Random number generator seed.
+    rng_seed: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CandidateLookupStrategy {
+    max_lookups: usize,
+    interval: Duration,
+}
+
+/// Perform a periodic self-lookup.
+///
+/// This is useful to update the buckets close to self. Random lookups will
+/// rarely hit these.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelfLookupStrategy {
+    interval: Duration,
+}
+
+/// Perform a periodic random lookup.
+///
+/// This is useful to update the buckets that are further away from self.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RandomLookupStrategy {
+    interval: Duration,
 }
 
 impl Config {
@@ -964,6 +1089,21 @@ impl Config {
             ..Default::default()
         }
     }
+
+    pub fn candidate_lookup_strategy(mut self, value: CandidateLookupStrategy) -> Self {
+        self.candidate_lookup_strategy = Some(value);
+        self
+    }
+
+    pub fn random_lookup_strategy(mut self, value: RandomLookupStrategy) -> Self {
+        self.random_lookup_strategy = Some(value);
+        self
+    }
+
+    pub fn self_lookup_strategy(mut self, value: SelfLookupStrategy) -> Self {
+        self.self_lookup_strategy = Some(value);
+        self
+    }
 }
 
 impl Default for Config {
@@ -973,6 +1113,10 @@ impl Default for Config {
             alpha: ALPHA,
             parallelism: 4,
             transient: true,
+            candidate_lookup_strategy: None,
+            random_lookup_strategy: None,
+            self_lookup_strategy: None,
+            rng_seed: None,
         }
     }
 }
@@ -1005,18 +1149,27 @@ where
     ) -> (Self, ApiClient) {
         let (api_tx, internal_rx) = tokio::sync::mpsc::channel(32);
         let api = ApiClient(api_tx.into());
+        let mut tasks = JoinSet::new();
+        let state = State {
+            api: api.clone(),
+            pool,
+            config: config.clone(),
+        };
+        tasks.spawn(state.clone().notify_self());
         (
             Self {
                 node,
                 rpc_rx: rx,
                 api_rx: internal_rx,
-                tasks: JoinSet::new(),
-                state: State {
-                    api: api.clone(),
-                    pool,
-                    config,
-                    candidates: IndexSet::new(),
-                },
+                tasks,
+                state,
+                candidates: config
+                    .candidate_lookup_strategy
+                    .map(|s| Candidates::new(s.max_lookups * config.k)),
+                rng: config
+                    .rng_seed
+                    .map(StdRng::from_seed)
+                    .unwrap_or(StdRng::from_entropy()),
             },
             api,
         )
@@ -1065,7 +1218,10 @@ where
                 }
             }
             ApiMessage::Lookup(msg) => {
-                let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
+                let initial = msg
+                    .initial
+                    .clone()
+                    .unwrap_or_else(|| self.node.routing_table.find_closest_nodes(&msg.id, K));
                 self.tasks
                     .spawn(self.state.clone().lookup(initial, msg.inner, msg.tx));
             }
@@ -1107,6 +1263,55 @@ where
                 }
                 msg.tx.send(stats).await.ok();
             }
+            ApiMessage::SelfLookup(msg) => {
+                let id = self.state.pool.id().into();
+                // todo: choose initial to be farthest away from self, otherwise
+                // the self lookup won't be very useful.
+                let api = self.state.api.clone();
+                self.tasks.spawn(async move {
+                    api.lookup(id, None).await.ok();
+                    msg.tx.send(()).await.ok();
+                });
+            }
+            ApiMessage::RandomLookup(msg) => {
+                let id = Id::from(self.rng.r#gen::<[u8; 32]>());
+                let api = self.state.api.clone();
+                self.tasks.spawn(async move {
+                    api.lookup(id, None).await.ok();
+                    msg.tx.send(()).await.ok();
+                });
+            }
+            ApiMessage::CandidateLookup(msg) => {
+                if self.state.config.candidate_lookup_strategy.is_none() {
+                    warn!(
+                        "Received CandidateLookup request, but no candidate lookup strategy is configured"
+                    );
+                    return;
+                };
+                let Some(candidates) = self.candidates.as_mut() else {
+                    warn!("Received CandidateLookup request, but no candidates are being tracked");
+                    return;
+                };
+                // use the most recent `max_lookups * k` candidates
+                let chosen = candidates.clear_and_take();
+                // perform a random lookup using the candidates as initial.
+                //
+                let api = self.state.api.clone();
+                let groups = chosen
+                    .chunks(self.state.config.k)
+                    .map(|chunk| {
+                        let id = Id::from(self.rng.r#gen::<[u8; 32]>());
+                        (id, chunk.to_vec())
+                    })
+                    .collect::<Vec<_>>();
+                self.tasks.spawn(async move {
+                    // this will check if they exist. If yes, they will be added to the routing table.
+                    for (id, ids) in groups {
+                        api.lookup(id, Some(ids)).await.ok();
+                    }
+                    msg.tx.send(()).await.ok();
+                });
+            }
         }
     }
 
@@ -1126,9 +1331,12 @@ where
                     .routing_table
                     .find_closest_nodes(&msg.key, self.state.config.k);
                 let self_dist = Distance::between(&self.node.id.as_bytes(), &msg.key);
-                if ids.iter().all(|id| {
-                    Distance::between(&self.node.id.as_bytes(), id.as_bytes()) < self_dist
-                }) && ids.len() >= self.state.config.k
+                // if we know k nodes that are closer to the key than we are, we don't want to store
+                // the data!
+                if ids.len() >= self.state.config.k
+                    && ids.iter().all(|id| {
+                        Distance::between(&self.node.id.as_bytes(), id.as_bytes()) < self_dist
+                    })
                 {
                     msg.tx.send(SetResponse::ErrDistance).await.ok();
                     return;
@@ -1173,22 +1381,38 @@ where
                     .map(|id| self.state.pool.node_addr(id))
                     .collect();
                 if let Some(requester) = msg.requester {
-                    self.state.candidates.insert(requester);
+                    self.add_candidate(requester);
                 }
                 msg.tx.send(ids).await.ok();
             }
         }
     }
+
+    fn add_candidate(&mut self, id: NodeId) {
+        if self.state.config.transient {
+            warn!("Received FindNode request for transient node");
+            return;
+        }
+        if self.node.routing_table.contains(&id) {
+            // we trust this node already, update the time
+            self.node.routing_table.add_node(NodeInfo {
+                id,
+                last_seen: now(),
+            });
+        }
+        let Some(candidates) = &mut self.candidates else {
+            // candidate tracking is not enabled
+            return;
+        };
+        // add it to the candidates for routing table inclusion
+        candidates.add(id);
+    }
 }
 
 impl<P: ClientPool> State<P> {
-    async fn lookup(self, initial: Vec<NodeId>, msg: Lookup, tx: mpsc::Sender<NodeId>) {
+    async fn lookup(self, initial: Vec<NodeId>, msg: Lookup, tx: oneshot::Sender<Vec<NodeId>>) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
-        for id in ids {
-            if tx.send(id).await.is_err() {
-                break; // Stop sending if the receiver is closed
-            }
-        }
+        tx.send(ids).await.ok();
     }
 
     async fn network_put(self, initial: Vec<NodeId>, msg: NetworkPut, tx: mpsc::Sender<NodeId>) {
@@ -1251,11 +1475,6 @@ impl<P: ClientPool> State<P> {
         } else {
             Some(self.pool.id())
         };
-        // todo: we are getting the full node infos from ourselves and then just using
-        // the node ids. Is this expensive? Depends on if Endpoint::remote_info is cheap.
-        //
-        // current impl seems cheap, so we might be fine. The alternative would be to add
-        // another api call to get just the non-augmented node ids.
         let infos = self
             .pool
             .with_client(id, move |client| async move {
@@ -1264,7 +1483,10 @@ impl<P: ClientPool> State<P> {
             })
             .await
             .map_err(|_| "Failed to query node")?;
-        let ids = infos.into_iter().map(|info| info.node_id).collect();
+        let ids = infos.iter().map(|info| info.node_id).collect();
+        for info in infos {
+            self.pool.add_node_addr(info);
+        }
         Ok(ids)
     }
 
@@ -1334,6 +1556,37 @@ impl<P: ClientPool> State<P> {
         // result already has size <= k
         result.into_iter().map(|(_, id)| id).collect()
     }
+
+    /// Task that sends messages to self in periodic intervals for routing
+    /// table maintenance, if configured.
+    async fn notify_self(self) {
+        let mut self_lookup = MaybeFuture::None;
+        let mut random_lookup = MaybeFuture::None;
+        let mut candidate_lookup = MaybeFuture::None;
+        if let Some(strategy) = &self.config.self_lookup_strategy {
+            let api = self.api.clone();
+            self_lookup = MaybeFuture::Some(api.self_lookup_periodic(strategy.interval));
+        }
+        if let Some(strategy) = &self.config.random_lookup_strategy {
+            let api = self.api.clone();
+            random_lookup = MaybeFuture::Some(api.random_lookup_periodic(strategy.interval));
+        }
+        if let Some(strategy) = &self.config.candidate_lookup_strategy {
+            let api = self.api.clone();
+            candidate_lookup = MaybeFuture::Some(api.candidate_lookup_periodic(strategy.interval));
+        }
+        tokio::pin!(self_lookup, random_lookup, candidate_lookup);
+        loop {
+            tokio::select! {
+                _ = &mut self_lookup => {
+                }
+                _ = &mut random_lookup => {
+                }
+                _ = &mut candidate_lookup => {
+                }
+            }
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -1350,7 +1603,7 @@ pub fn create_node<P: ClientPool>(
     create_node_impl(id, pool, bootstrap, None, config)
 }
 
-/// Create a node, given an id, a set of bootstrap nodes, a
+/// Create a node, with the option to set the initial routing table buckets
 fn create_node_impl<P: ClientPool>(
     id: NodeId,
     pool: P,

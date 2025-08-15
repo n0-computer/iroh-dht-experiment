@@ -2,10 +2,7 @@
 //!
 //! These are long running tests that spawn a lot of nodes and observe the
 //! behaviour of an entire swarm. Most tests use in-memory nodes.
-use std::{
-    num::NonZeroU64,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use iroh::{
     Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider, endpoint::BindError,
@@ -56,7 +53,9 @@ fn expected_ids(ids: &[NodeId], key: Id, n: usize) -> Vec<NodeId> {
         .cloned()
         .map(|id| (Distance::between(&id.as_bytes(), &key), id))
         .collect::<Vec<_>>();
-    expected.sort();
+    // distances are unique!
+    expected.sort_unstable();
+    expected.dedup();
     expected.truncate(n);
     expected.into_iter().map(|(_, id)| id).collect()
 }
@@ -72,11 +71,7 @@ fn rng(seed: u64) -> StdRng {
 /// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
 ///
 /// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
-async fn create_nodes(
-    ids: &[NodeId],
-    mut n_bootstrap: usize,
-    buckets: Option<Box<Buckets>>,
-) -> Nodes {
+async fn create_nodes(ids: &[NodeId], mut n_bootstrap: usize, config: Config) -> Nodes {
     let n = ids.len();
     n_bootstrap = n_bootstrap.min(n - 1);
     let clients = Arc::new(Mutex::new(BTreeMap::new()));
@@ -94,7 +89,7 @@ async fn create_nodes(
                 .collect::<Vec<_>>();
             (
                 *id,
-                create_node_impl(*id, pool, bootstrap, buckets.clone(), Default::default()),
+                create_node_impl(*id, pool, bootstrap, None, config.clone()),
             )
         })
         .collect::<Vec<_>>();
@@ -157,9 +152,7 @@ async fn random_lookup(nodes: &Nodes, rng: &mut StdRng) -> irpc::Result<()> {
             let key = Id::from(rng.r#gen::<[u8; 32]>());
             async move {
                 // perform a random lookup
-                api.lookup(key, None, Some(NonZeroU64::new(20).unwrap()))
-                    .await
-                    .ok();
+                api.lookup(key, None).await.ok();
             }
         })
         .await;
@@ -235,6 +228,67 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     Ok(())
 }
 
+/// Performs n random lookups without storing anything, then plots stats
+async fn plot_random_lookup_stats(nodes: &Nodes, n: usize) -> irpc::Result<()> {
+    let (_, (_, api)) = nodes[nodes.len() / 2].clone();
+    let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let mut common_count = vec![0usize; n];
+    let mut storage_count = vec![0usize; nodes.len()];
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        if nodes.len() > 10000 {
+            println!("{i}");
+        }
+        let text = format!("Item {i}");
+        let id = Id::from(blake3::hash(text.as_bytes()));
+        let storage_ids = api.lookup(id, None).await.unwrap();
+        let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
+        let mut common = expected_ids.clone();
+        common.retain(|id| storage_ids.contains(id));
+        common_count[i] = common.len();
+        for id in &storage_ids {
+            let idx = ids.iter().position(|x| *x == *id).unwrap();
+            storage_count[idx] += 1;
+        }
+    }
+
+    let mut routing_table_size = vec![0usize; nodes.len()];
+    for (index, (_, (_, api))) in nodes.iter().enumerate() {
+        let stats = api.get_storage_stats().await?;
+        if !stats.is_empty() {
+            let n = stats
+                .values()
+                .map(|kinds| kinds.values().sum::<usize>())
+                .sum::<usize>();
+            storage_count[index] = n;
+            // println!("Storage stats for node {index}: {n}");
+        }
+    }
+
+    for (index, (_, (_, api))) in nodes.iter().enumerate() {
+        let routing_table = api.get_routing_table().await?;
+        let count = routing_table.iter().map(|peers| peers.len()).sum::<usize>();
+        // println!("Routing table {index}: {count} nodes");
+        routing_table_size[index] = count;
+    }
+
+    plot(
+        "Histogram - Commonality with perfect set of 20 ids",
+        &make_histogram(&common_count),
+    );
+    plot("Storage usage per node", &storage_count);
+    plot(
+        "Histogram - Storage usage per node",
+        &make_histogram(&storage_count),
+    );
+    plot("Routing table size per node", &routing_table_size);
+    plot(
+        "Histogram - Routing table size per node",
+        &make_histogram(&routing_table_size),
+    );
+    Ok(())
+}
+
 /// Create routing table buckets for the given ids.
 ///
 /// Note that if there are a lot of ids, they won't all fit.
@@ -252,14 +306,14 @@ fn create_buckets(ids: &[NodeId]) -> Box<Buckets> {
     routing_table.buckets
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn no_routing_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
     let clients = nodes.iter().cloned().collect::<BTreeMap<_, _>>();
 
     for i in 0..100 {
@@ -297,26 +351,26 @@ async fn no_routing_1k() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn perfect_routing_tables_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
     store_random_values(&nodes, 100).await.ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn perfect_routing_tables_10k() {
     let n = 10000;
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
 
     // tell all nodes about all ids, shuffled for each node
     println!("init routing tables");
@@ -335,7 +389,7 @@ async fn perfect_routing_tables_100k() {
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
 
     println!("init routing tables");
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
@@ -344,14 +398,14 @@ async fn perfect_routing_tables_100k() {
     store_random_values(&nodes, 100).await.ok();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn just_bootstrap_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 20;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
 
     // tell all nodes about all ids, shuffled for each node
     // init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
@@ -363,7 +417,7 @@ async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
     let bootstrap = 20;
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
-    let nodes = create_nodes(&ids, bootstrap, None).await;
+    let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
 
     random_lookup_n(&nodes, lookups, seed).await.ok();
 
@@ -379,7 +433,7 @@ async fn random_lookup_1k() {
     }
 }
 
-const DHT_TEST_ALPN: &[u8] = b"iroh/dht/0";
+const DHT_TEST_ALPN: &[u8] = b"iroh/dht/test-0";
 
 type IrohNodes = Vec<(Endpoint, (RpcClient, ApiClient))>;
 
@@ -467,7 +521,7 @@ fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
     let n = 500;
     let seed = 0;
@@ -487,4 +541,62 @@ async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
     println!("Storing random values");
     store_random_values(&nodes, 100).await.ok();
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn random_lookup_strategy() {
+    let n = 1000;
+    let seed = 0;
+    let bootstrap = 20;
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    let config = Config::default().random_lookup_strategy(RandomLookupStrategy {
+        interval: Duration::from_secs(1),
+    });
+    let nodes = create_nodes(&ids, bootstrap, config).await;
+    for i in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        println!("\nAfter {i}s");
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_lookup_strategy() {
+    let n = 1000;
+    let seed = 0;
+    let bootstrap = 20;
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    let config = Config::default().self_lookup_strategy(SelfLookupStrategy {
+        interval: Duration::from_secs(1),
+    });
+    let nodes = create_nodes(&ids, bootstrap, config).await;
+    for i in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        println!("\nAfter {i}s");
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_and_random_lookup_strategy() {
+    let n = 1000;
+    let seed = 0;
+    let bootstrap = 20;
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    let config = Config::default()
+        .self_lookup_strategy(SelfLookupStrategy {
+            interval: Duration::from_secs(1),
+        })
+        .random_lookup_strategy(RandomLookupStrategy {
+            interval: Duration::from_secs(1),
+        });
+    let nodes = create_nodes(&ids, bootstrap, config).await;
+    for i in 0..20 {
+        println!("\nAfter {i}s");
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
