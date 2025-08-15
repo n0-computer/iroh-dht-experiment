@@ -1047,6 +1047,16 @@ pub struct Config {
     rng_seed: Option<[u8; 32]>,
 }
 
+/// This is the mechanism for adding new nodes to a DHT.
+///
+/// When we find a node that is not in our routing table, we don't immediately
+/// update our routing table. It could be a node that claims to be permanent
+/// but is transient. Instead, we add it to a list of candidates for inclusion
+/// that gets used periodically.
+///
+/// We perform random lookups with the candidate nodes as initial peers. This
+/// will cause them to be validated by sending them a FindNode query, and as
+/// a side effect of validating we update our routing table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CandidateLookupStrategy {
     max_lookups: usize,
@@ -1065,7 +1075,7 @@ pub struct SelfLookupStrategy {
 
 /// Perform a periodic random lookup.
 ///
-/// This is useful to update the buckets that are further away from self.
+/// This is useful to update the buckets that are far away from self.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RandomLookupStrategy {
     interval: Duration,
