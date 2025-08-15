@@ -56,10 +56,10 @@
 //!
 //! A DHT node is controlled using the [api] protocol, which contains higher
 //! level operations that trigger interactions with multiple DHT nodes.
-//! 
+//!
 //! Both protocols are implemented using the [irpc] crate. As an intro to irpc,
 //! see the [irpc blog post].
-//! 
+//!
 //! [bep_0044]: https://www.bittorrent.org/beps/bep_0044.html
 //! [bep_0005]: https://www.bittorrent.org/beps/bep_0005.html
 //! [kademlia]: https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf
@@ -74,6 +74,7 @@ use std::{
 
 use futures_buffered::FuturesUnordered;
 use indexmap::IndexSet;
+use iroh::NodeId;
 use irpc::channel::mpsc;
 use n0_future::{BufferedStreamExt, StreamExt, stream};
 use rand::{SeedableRng, seq::index::sample};
@@ -95,7 +96,7 @@ pub mod rpc {
     //! The entry point is [`RpcClient`].
     use std::{fmt, num::NonZeroU64, ops::Deref};
 
-    use iroh::{Endpoint, PublicKey};
+    use iroh::{Endpoint, NodeAddr, NodeId, PublicKey};
     use iroh_base::SignatureError;
     use irpc::{
         channel::{mpsc, oneshot},
@@ -207,6 +208,12 @@ pub mod rpc {
         }
     }
 
+    impl From<blake3::Hash> for Id {
+        fn from(pk: blake3::Hash) -> Self {
+            Id(*pk.as_bytes())
+        }
+    }
+
     impl Id {
         pub fn blake3_hash(data: &[u8]) -> Self {
             let hash = blake3::hash(data);
@@ -269,7 +276,10 @@ pub mod rpc {
         /// The key to find the most natural locations (nodes) for.
         pub id: Id,
         /// The requester wants to be included in the routing table.
-        pub requester: Option<Id>,
+        ///
+        /// For the irpc memory transport, you have to just believe this value.
+        /// For the irpc iroh transport, this must be the node ID of the requester.
+        pub requester: Option<NodeId>,
     }
 
     /// Protocol for rpc communication.
@@ -288,7 +298,7 @@ pub mod rpc {
         #[rpc(tx = mpsc::Sender<Value>)]
         GetAll(GetAll),
         /// A request to query the routing table for the most natural locations
-        #[rpc(tx = oneshot::Sender<Vec<Id>>)]
+        #[rpc(tx = oneshot::Sender<Vec<NodeAddr>>)]
         FindNode(FindNode),
     }
 
@@ -322,7 +332,11 @@ pub mod rpc {
                 .await
         }
 
-        pub async fn find_node(&self, id: Id, requester: Option<Id>) -> irpc::Result<Vec<Id>> {
+        pub async fn find_node(
+            &self,
+            id: Id,
+            requester: Option<NodeId>,
+        ) -> irpc::Result<Vec<NodeAddr>> {
             self.0.rpc(FindNode { id, requester }).await
         }
     }
@@ -339,6 +353,7 @@ pub mod api {
     //! The entry point is [`ApiClient`].
     use std::{collections::BTreeMap, num::NonZeroU64};
 
+    use iroh::NodeId;
     use irpc::{
         channel::{mpsc, none::NoSender, oneshot},
         rpc_requests,
@@ -354,19 +369,23 @@ pub mod api {
     #[rpc_requests(message = ApiMessage)]
     #[derive(Debug, Serialize, Deserialize)]
     pub enum ApiProto {
+        /// NodesSeen can only be called for node ids, but we don't bother
+        /// to provide AddrInfo here since the routing table does not store it.
         #[rpc(wrap, tx = NoSender)]
-        NodesSeen { ids: Vec<Id> },
+        NodesSeen { ids: Vec<NodeId> },
+        /// NodesDead can only be called for node ids, but we don't bother
+        /// to provide AddrInfo here since the routing table does not store it.
         #[rpc(wrap, tx = NoSender)]
-        NodesDead { ids: Vec<Id> },
-        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        NodesDead { ids: Vec<NodeId> },
+        #[rpc(wrap, tx = mpsc::Sender<NodeId>)]
         Lookup {
             id: Id,
             seed: Option<NonZeroU64>,
             n: Option<NonZeroU64>,
         },
-        #[rpc(wrap, tx = mpsc::Sender<Id>)]
+        #[rpc(wrap, tx = mpsc::Sender<NodeId>)]
         NetworkPut { id: Id, value: Value },
-        #[rpc(wrap, tx = mpsc::Sender<(Id, Value)>)]
+        #[rpc(wrap, tx = mpsc::Sender<(NodeId, Value)>)]
         NetworkGet {
             id: Id,
             kind: Kind,
@@ -388,14 +407,14 @@ pub mod api {
         /// notify the node that we have just seen these nodes.
         ///
         /// The impl should add these nodes to the routing table.
-        pub async fn nodes_seen(&self, ids: &[Id]) -> irpc::Result<()> {
+        pub async fn nodes_seen(&self, ids: &[NodeId]) -> irpc::Result<()> {
             self.0.notify(NodesSeen { ids: ids.to_vec() }).await
         }
 
         /// notify the node that we have tried to contact these nodes and have not gotten a response.
         ///
         /// The impl can either clean these nodes from its routing table immediately or after a repeat offense.
-        pub async fn nodes_dead(&self, ids: &[Id]) -> irpc::Result<()> {
+        pub async fn nodes_dead(&self, ids: &[NodeId]) -> irpc::Result<()> {
             self.0.notify(NodesDead { ids: ids.to_vec() }).await
         }
 
@@ -412,7 +431,7 @@ pub mod api {
             id: Id,
             seed: Option<NonZeroU64>,
             n: Option<NonZeroU64>,
-        ) -> irpc::Result<irpc::channel::mpsc::Receiver<Id>> {
+        ) -> irpc::Result<irpc::channel::mpsc::Receiver<NodeId>> {
             self.0.server_streaming(Lookup { id, seed, n }, 32).await
         }
 
@@ -452,7 +471,10 @@ pub mod api {
             }
         }
 
-        pub async fn put_immutable(&self, value: &[u8]) -> irpc::Result<(blake3::Hash, Vec<Id>)> {
+        pub async fn put_immutable(
+            &self,
+            value: &[u8],
+        ) -> irpc::Result<(blake3::Hash, Vec<NodeId>)> {
             let hash = blake3::hash(value);
             let id = Id::from(*hash.as_bytes());
             let mut rx = self
@@ -490,6 +512,7 @@ mod routing {
     };
 
     use arrayvec::ArrayVec;
+    use iroh::NodeId;
     use serde::{Deserialize, Serialize};
 
     use super::rpc::Id;
@@ -499,7 +522,7 @@ mod routing {
     pub const BUCKET_COUNT: usize = 256; // For 256-bit keys
 
     /// Calculate XOR distance between two 32-byte values
-    fn xor(a: &Id, b: &Id) -> [u8; 32] {
+    fn xor(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         let mut result = [0u8; 32];
         for i in 0..32 {
             result[i] = a[i] ^ b[i];
@@ -521,15 +544,15 @@ mod routing {
     pub struct Distance([u8; 32]);
 
     impl Distance {
-        pub fn between(a: &Id, b: &Id) -> Self {
+        pub fn between(a: &[u8; 32], b: &[u8; 32]) -> Self {
             Self(xor(a, b))
         }
 
         /// This is the inverse of between.
         ///
         /// Distance::between(&x, &y).to_node(&y) == x
-        pub fn inverse(&self, target: &Id) -> Id {
-            Id::from(xor(&Id::from(self.0), target))
+        pub fn inverse(&self, b: &[u8; 32]) -> [u8; 32] {
+            xor(&self.0, b)
         }
 
         pub const MAX: Self = Self([u8::MAX; 32]);
@@ -549,12 +572,12 @@ mod routing {
 
     #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
     pub struct NodeInfo {
-        pub id: Id,
+        pub id: NodeId,
         pub last_seen: u64,
     }
 
     impl NodeInfo {
-        pub fn new(id: Id, last_seen: u64) -> Self {
+        pub fn new(id: NodeId, last_seen: u64) -> Self {
             Self { id, last_seen }
         }
     }
@@ -589,7 +612,7 @@ mod routing {
             false // Bucket full
         }
 
-        fn remove_node(&mut self, id: &Id) {
+        fn remove_node(&mut self, id: &NodeId) {
             self.nodes.retain(|n| n.id != *id);
         }
 
@@ -601,7 +624,7 @@ mod routing {
     #[derive(Debug)]
     pub(crate) struct RoutingTable {
         pub buckets: Box<Buckets>,
-        local_id: Id,
+        local_id: NodeId,
     }
 
     #[derive(Debug, Clone)]
@@ -633,7 +656,7 @@ mod routing {
     }
 
     impl RoutingTable {
-        pub fn new(local_id: Id, buckets: Option<Box<Buckets>>) -> Self {
+        pub fn new(local_id: NodeId, buckets: Option<Box<Buckets>>) -> Self {
             let buckets = buckets
                 .map(|mut buckets| {
                     for bucket in buckets.0.iter_mut() {
@@ -645,8 +668,8 @@ mod routing {
             Self { buckets, local_id }
         }
 
-        fn bucket_index(&self, target: &Id) -> usize {
-            let distance = xor(&self.local_id, target);
+        fn bucket_index(&self, target: &[u8; 32]) -> usize {
+            let distance = xor(&self.local_id.as_bytes(), target);
             let zeros = leading_zeros(&distance);
             if zeros >= BUCKET_COUNT {
                 0 // Same node case
@@ -660,12 +683,12 @@ mod routing {
                 return false;
             }
 
-            let bucket_idx = self.bucket_index(&node.id);
+            let bucket_idx = self.bucket_index(node.id.as_bytes());
             self.buckets[bucket_idx].add_node(node)
         }
 
-        pub(crate) fn remove_node(&mut self, id: &Id) {
-            let bucket_idx = self.bucket_index(id);
+        pub(crate) fn remove_node(&mut self, id: &NodeId) {
+            let bucket_idx = self.bucket_index(id.as_bytes());
             self.buckets[bucket_idx].remove_node(id);
         }
 
@@ -673,14 +696,17 @@ mod routing {
             self.buckets.iter().flat_map(|bucket| bucket.nodes())
         }
 
-        pub(crate) fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<Id> {
+        pub(crate) fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<NodeId> {
             // this does a brute force scan, but even so it should be very fast.
             // xor is basically free, and comparing distances as well.
             // so the most expensive thing is probably the memory allocation.
             //
             // for a full routing table, this would be 256*20*32 = 163840 bytes.
             let mut candidates = Vec::with_capacity(self.nodes().count());
-            candidates.extend(self.nodes().map(|node| Distance::between(target, &node.id)));
+            candidates.extend(
+                self.nodes()
+                    .map(|node| Distance::between(target, node.id.as_bytes())),
+            );
             if k < candidates.len() {
                 candidates.select_nth_unstable(k - 1);
                 candidates.truncate(k);
@@ -689,7 +715,10 @@ mod routing {
 
             candidates
                 .into_iter()
-                .map(|dist| dist.inverse(target))
+                .map(|dist| {
+                    NodeId::from_bytes(&dist.inverse(target))
+                        .expect("inverse called with different target than between")
+                })
                 .collect()
         }
     }
@@ -703,7 +732,7 @@ use crate::{
 };
 
 struct Node {
-    id: Id,
+    id: NodeId,
     routing_table: RoutingTable,
     storage: MemStorage,
 }
@@ -743,15 +772,17 @@ pub mod pool {
     //!
     //! This can be implemented with an in-memory implementation for tests,
     //! and with a proper iroh connection pool for real use.
+    use std::collections::BTreeSet;
+
     use iroh::{
-        PublicKey,
+        Endpoint, NodeAddr, NodeId,
         endpoint::{Connection, RecvStream, SendStream},
     };
     use iroh_connection_pool::connection_pool::ConnectionPool;
     use snafu::Snafu;
     use tracing::trace;
 
-    use crate::rpc::{Id, RpcClient};
+    use crate::rpc::RpcClient;
 
     /// A pool that can efficiently provide clients given a node id, and knows its
     /// own identity.
@@ -760,7 +791,18 @@ pub mod pool {
     /// wrap an iroh Endpoint and have some sort of connection cache.
     pub trait ClientPool: Send + Sync + Clone + Sized + 'static {
         /// Our own node id
-        fn id(&self) -> Id;
+        fn id(&self) -> NodeId;
+
+        /// Adds dialing info to a node id.
+        ///
+        /// The default impl doesn't add anything.
+        fn node_addr(&self, node_id: NodeId) -> NodeAddr {
+            NodeAddr {
+                node_id,
+                relay_url: None,
+                direct_addresses: BTreeSet::new(),
+            }
+        }
 
         /// Use the client to perform an operation.
         ///
@@ -768,7 +810,7 @@ pub mod pool {
         /// can become unusable at any time!
         fn with_client<F, Fut, R, E>(
             &self,
-            id: Id,
+            id: NodeId,
             f: F,
         ) -> impl Future<Output = Result<R, E>> + Send
         where
@@ -786,13 +828,13 @@ pub mod pool {
 
     #[derive(Debug, Clone)]
     pub struct IrohPool {
-        id: PublicKey,
+        endpoint: Endpoint,
         inner: ConnectionPool,
     }
 
     impl IrohPool {
-        pub fn new(id: PublicKey, inner: ConnectionPool) -> Self {
-            Self { id, inner }
+        pub fn new(endpoint: Endpoint, inner: ConnectionPool) -> Self {
+            Self { endpoint, inner }
         }
     }
 
@@ -818,18 +860,29 @@ pub mod pool {
     }
 
     impl ClientPool for IrohPool {
-        fn id(&self) -> Id {
-            Id::node_id(self.id)
+        fn id(&self) -> NodeId {
+            self.endpoint.node_id()
         }
 
-        async fn with_client<F, Fut, R, E>(&self, id: Id, f: F) -> Result<R, E>
+        fn node_addr(&self, node_id: NodeId) -> NodeAddr {
+            // enrich the node id with available dialing info if available.
+            //
+            // for ids in our routing table, we should have dialed them at some
+            // point, so we should have some info for them. If not, the
+            // receiver will have to rely on node discovery.
+            match self.endpoint.remote_info(node_id) {
+                Some(info) => info.into(),
+                None => node_id.into(),
+            }
+        }
+
+        async fn with_client<F, Fut, R, E>(&self, node_id: NodeId, f: F) -> Result<R, E>
         where
             F: FnOnce(RpcClient) -> Fut + Send + 'static,
             Fut: Future<Output = Result<R, E>> + Send + 'static,
             R: Send + 'static,
             E: From<PoolError> + Send + 'static,
         {
-            let node_id = PublicKey::from_bytes(&id).unwrap();
             trace!(%node_id, "Connecting");
             let res = self
                 .inner
@@ -859,7 +912,9 @@ struct State<P> {
     /// configuration
     config: Config,
     /// candidates for inclusion in the routing table
-    candidates: IndexSet<Id>,
+    ///
+    /// todo! actually use them!
+    candidates: IndexSet<NodeId>,
 }
 
 struct Actor<P> {
@@ -1070,10 +1125,10 @@ where
                     .node
                     .routing_table
                     .find_closest_nodes(&msg.key, self.state.config.k);
-                let self_dist = Distance::between(&self.node.id, &msg.key);
-                if ids
-                    .iter()
-                    .all(|id| Distance::between(&self.node.id, id) < self_dist) && ids.len() >= self.state.config.k
+                let self_dist = Distance::between(&self.node.id.as_bytes(), &msg.key);
+                if ids.iter().all(|id| {
+                    Distance::between(&self.node.id.as_bytes(), id.as_bytes()) < self_dist
+                }) && ids.len() >= self.state.config.k
                 {
                     msg.tx.send(SetResponse::ErrDistance).await.ok();
                     return;
@@ -1112,7 +1167,11 @@ where
                 let ids = self
                     .node
                     .routing_table
-                    .find_closest_nodes(&msg.id, self.state.config.k);
+                    .find_closest_nodes(&msg.id, self.state.config.k)
+                    .into_iter()
+                    .take(self.state.config.k) // should not be needed, but just in case
+                    .map(|id| self.state.pool.node_addr(id))
+                    .collect();
                 if let Some(requester) = msg.requester {
                     self.state.candidates.insert(requester);
                 }
@@ -1123,7 +1182,7 @@ where
 }
 
 impl<P: ClientPool> State<P> {
-    async fn lookup(self, initial: Vec<Id>, msg: Lookup, tx: mpsc::Sender<Id>) {
+    async fn lookup(self, initial: Vec<NodeId>, msg: Lookup, tx: mpsc::Sender<NodeId>) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         for id in ids {
             if tx.send(id).await.is_err() {
@@ -1132,7 +1191,7 @@ impl<P: ClientPool> State<P> {
         }
     }
 
-    async fn network_put(self, initial: Vec<Id>, msg: NetworkPut, tx: mpsc::Sender<Id>) {
+    async fn network_put(self, initial: Vec<NodeId>, msg: NetworkPut, tx: mpsc::Sender<NodeId>) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)
             .for_each_concurrent(self.config.parallelism, |id| {
@@ -1153,7 +1212,12 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
-    async fn network_get(self, initial: Vec<Id>, msg: NetworkGet, tx: mpsc::Sender<(Id, Value)>) {
+    async fn network_get(
+        self,
+        initial: Vec<NodeId>,
+        msg: NetworkGet,
+        tx: mpsc::Sender<(NodeId, Value)>,
+    ) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)
             .for_each_concurrent(self.config.parallelism, |id| {
@@ -1181,34 +1245,43 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
-    async fn query_one(&self, id: Id, target: Id) -> Result<Vec<Id>, &'static str> {
+    async fn query_one(&self, id: NodeId, target: Id) -> Result<Vec<NodeId>, &'static str> {
         let requester = if self.config.transient {
             None
         } else {
             Some(self.pool.id())
         };
-        let ids = self
+        // todo: we are getting the full node infos from ourselves and then just using
+        // the node ids. Is this expensive? Depends on if Endpoint::remote_info is cheap.
+        //
+        // current impl seems cheap, so we might be fine. The alternative would be to add
+        // another api call to get just the non-augmented node ids.
+        let infos = self
             .pool
             .with_client(id, move |client| async move {
                 let ids = client.find_node(target, requester).await?;
-                std::result::Result::<Vec<Id>, Error>::Ok(ids)
+                std::result::Result::<Vec<_>, Error>::Ok(ids)
             })
             .await
             .map_err(|_| "Failed to query node")?;
+        let ids = infos.into_iter().map(|info| info.node_id).collect();
         Ok(ids)
     }
 
-    async fn iterative_find_node(self, target: Id, initial: Vec<Id>) -> Vec<Id> {
+    async fn iterative_find_node(self, target: Id, initial: Vec<NodeId>) -> Vec<NodeId> {
         let mut candidates = initial
             .into_iter()
-            .filter(|id| *id != self.pool.id())
-            .map(|id| (Distance::between(&target, &id), id))
+            .filter(|addr| *addr != self.pool.id())
+            .map(|id| (Distance::between(&target, &id.as_bytes()), id))
             .collect::<BTreeSet<_>>();
         let mut queried = HashSet::new();
         let mut tasks = FuturesUnordered::new();
         let mut result = BTreeSet::new();
         queried.insert(self.pool.id());
-        result.insert((Distance::between(&self.pool.id(), &target), self.pool.id()));
+        result.insert((
+            Distance::between(&self.pool.id().as_bytes(), &target),
+            self.pool.id(),
+        ));
 
         loop {
             for _ in 0..self.config.alpha {
@@ -1226,7 +1299,7 @@ impl<P: ClientPool> State<P> {
                     continue;
                 };
                 for cand in cands {
-                    let dist = Distance::between(&target, &cand);
+                    let dist = Distance::between(&target, &cand.as_bytes());
                     if !queried.contains(&cand) {
                         candidates.insert((dist, cand));
                     }
@@ -1269,9 +1342,9 @@ fn now() -> u64 {
 
 /// Creates a DHT node
 pub fn create_node<P: ClientPool>(
-    id: Id,
+    id: NodeId,
     pool: P,
-    bootstrap: Vec<Id>,
+    bootstrap: Vec<NodeId>,
     config: Config,
 ) -> (RpcClient, ApiClient) {
     create_node_impl(id, pool, bootstrap, None, config)
@@ -1279,9 +1352,9 @@ pub fn create_node<P: ClientPool>(
 
 /// Create a node, given an id, a set of bootstrap nodes, a
 fn create_node_impl<P: ClientPool>(
-    id: Id,
+    id: NodeId,
     pool: P,
-    bootstrap: Vec<Id>,
+    bootstrap: Vec<NodeId>,
     buckets: Option<Box<Buckets>>,
     config: Config,
 ) -> (RpcClient, ApiClient) {

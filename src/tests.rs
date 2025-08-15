@@ -8,8 +8,8 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider,
-    endpoint::BindError, protocol::Router,
+    Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider, endpoint::BindError,
+    protocol::Router,
 };
 use iroh_connection_pool::connection_pool::ConnectionPool;
 use rand::{Rng, rngs::StdRng, seq::SliceRandom};
@@ -21,12 +21,12 @@ use crate::{pool::IrohPool, rpc::Blake3Immutable};
 
 #[derive(Debug, Clone)]
 struct TestPool {
-    clients: Arc<Mutex<BTreeMap<Id, RpcClient>>>,
-    id: Id,
+    clients: Arc<Mutex<BTreeMap<NodeId, RpcClient>>>,
+    node_id: NodeId,
 }
 
 impl ClientPool for TestPool {
-    async fn with_client<F, Fut, R, E>(&self, id: Id, f: F) -> Result<R, E>
+    async fn with_client<F, Fut, R, E>(&self, id: NodeId, f: F) -> Result<R, E>
     where
         F: FnOnce(RpcClient) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, E>> + Send + 'static,
@@ -45,23 +45,23 @@ impl ClientPool for TestPool {
         f(client).await
     }
 
-    fn id(&self) -> Id {
-        self.id
+    fn id(&self) -> NodeId {
+        self.node_id
     }
 }
 
-fn expected_ids(ids: &[Id], key: Id, n: usize) -> Vec<Id> {
+fn expected_ids(ids: &[NodeId], key: Id, n: usize) -> Vec<NodeId> {
     let mut expected = ids
         .iter()
         .cloned()
-        .map(|id| (Distance::between(&id, &key), id))
+        .map(|id| (Distance::between(&id.as_bytes(), &key), id))
         .collect::<Vec<_>>();
     expected.sort();
     expected.truncate(n);
     expected.into_iter().map(|(_, id)| id).collect()
 }
 
-type Nodes = Vec<(Id, (RpcClient, ApiClient))>;
+type Nodes = Vec<(NodeId, (RpcClient, ApiClient))>;
 
 fn rng(seed: u64) -> StdRng {
     let mut expanded = [0; 32];
@@ -69,15 +69,14 @@ fn rng(seed: u64) -> StdRng {
     StdRng::from_seed(expanded)
 }
 
-fn create_ids(seed: u64, n: usize) -> Vec<Id> {
-    let mut rng = rng(seed);
-    (0..n).map(|_| Id::from(rng.r#gen::<[u8; 32]>())).collect()
-}
-
 /// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
 ///
 /// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
-async fn create_nodes(ids: &[Id], mut n_bootstrap: usize, buckets: Option<Box<Buckets>>) -> Nodes {
+async fn create_nodes(
+    ids: &[NodeId],
+    mut n_bootstrap: usize,
+    buckets: Option<Box<Buckets>>,
+) -> Nodes {
     let n = ids.len();
     n_bootstrap = n_bootstrap.min(n - 1);
     let clients = Arc::new(Mutex::new(BTreeMap::new()));
@@ -88,7 +87,7 @@ async fn create_nodes(ids: &[Id], mut n_bootstrap: usize, buckets: Option<Box<Bu
         .map(|(offfset, id)| {
             let pool = TestPool {
                 clients: clients.clone(),
-                id: *id,
+                node_id: *id,
             };
             let bootstrap = (0..n_bootstrap)
                 .map(|i| ids[(offfset + i + 1) % n])
@@ -109,7 +108,7 @@ async fn create_nodes(ids: &[Id], mut n_bootstrap: usize, buckets: Option<Box<Bu
 /// Brute force init of the routing table of all nodes using a set of ids, that could be the full set.
 ///
 /// Provide a seed to shuffle the ids for each node.
-async fn init_routing_tables(nodes: &Nodes, ids: &[Id], seed: Option<u64>) -> irpc::Result<()> {
+async fn init_routing_tables(nodes: &Nodes, ids: &[NodeId], seed: Option<u64>) -> irpc::Result<()> {
     let mut rng = seed.map(rng);
     let ids = ids.to_vec();
     stream::iter(nodes.iter().enumerate())
@@ -240,8 +239,10 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
 ///
 /// Note that if there are a lot of ids, they won't all fit.
 #[allow(dead_code)]
-fn create_buckets(ids: &[Id]) -> Box<Buckets> {
-    let mut routing_table = RoutingTable::new(Id::from([0; 32]), None);
+fn create_buckets(ids: &[NodeId]) -> Box<Buckets> {
+    let secret = SecretKey::from_bytes(&[0; 32]);
+    let node_id = secret.public();
+    let mut routing_table = RoutingTable::new(node_id, None);
     for id in ids {
         routing_table.add_node(NodeInfo {
             id: *id,
@@ -256,7 +257,8 @@ async fn no_routing_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 0;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
     let clients = nodes.iter().cloned().collect::<BTreeMap<_, _>>();
 
@@ -300,7 +302,8 @@ async fn perfect_routing_tables_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 0;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
     store_random_values(&nodes, 100).await.ok();
@@ -311,7 +314,8 @@ async fn perfect_routing_tables_10k() {
     let n = 10000;
     let seed = 0;
     let bootstrap = 0;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
 
     // tell all nodes about all ids, shuffled for each node
@@ -329,7 +333,8 @@ async fn perfect_routing_tables_100k() {
     let n = 100000;
     let seed = 0;
     let bootstrap = 0;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
 
     println!("init routing tables");
@@ -344,7 +349,8 @@ async fn just_bootstrap_1k() {
     let n = 1000;
     let seed = 0;
     let bootstrap = 20;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
 
     // tell all nodes about all ids, shuffled for each node
@@ -355,7 +361,8 @@ async fn just_bootstrap_1k() {
 async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
     // bootstrap must be set so the random lookups have a chance to work!
     let bootstrap = 20;
-    let ids = create_ids(seed, n);
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, None).await;
 
     random_lookup_n(&nodes, lookups, seed).await.ok();
@@ -388,16 +395,16 @@ async fn iroh_create_nodes(
     buckets: Option<Box<Buckets>>,
 ) -> std::result::Result<IrohNodes, BindError> {
     let n = secrets.len();
-    let publics = secrets.iter().map(|s| s.public()).collect::<Vec<_>>();
-    let ids = Arc::new(publics.iter().map(|p| Id::from(*p)).collect::<Vec<_>>());
+    let node_ids = secrets.iter().map(|s| s.public()).collect::<Vec<_>>();
+    let node_ids = Arc::new(node_ids);
     let buckets = Arc::new(buckets);
     let discovery = StaticProvider::new();
     n_bootstrap = n_bootstrap.min(n - 1);
     // create n nodes
-    stream::iter(secrets.iter().zip(publics.iter()).enumerate())
-        .map(|(offfset, (secret, public))| {
+    stream::iter(secrets.iter().zip(node_ids.iter()).enumerate())
+        .map(|(offfset, (secret, node_id))| {
             let buckets = buckets.clone();
-            let ids = ids.clone();
+            let node_ids = node_ids.clone();
             let discovery = discovery.clone();
             async move {
                 let endpoint = Endpoint::builder()
@@ -409,14 +416,19 @@ async fn iroh_create_nodes(
                 let addr = endpoint.node_addr().initialized().await;
                 discovery.add_node_info(addr.clone());
                 let pool = ConnectionPool::new(endpoint.clone(), DHT_TEST_ALPN, Default::default());
-                let pool = IrohPool::new(*public, pool);
+                let pool = IrohPool::new(endpoint.clone(), pool);
                 let bootstrap = (0..n_bootstrap)
-                    .map(|i| ids[(offfset + i + 1) % n])
+                    .map(|i| node_ids[(offfset + i + 1) % n])
                     .collect::<Vec<_>>();
-                let id = Id::from(*public);
                 Ok((
                     endpoint,
-                    create_node_impl(id, pool, bootstrap, (*buckets).clone(), Default::default()),
+                    create_node_impl(
+                        *node_id,
+                        pool,
+                        bootstrap,
+                        (*buckets).clone(),
+                        Default::default(),
+                    ),
                 ))
             }
         })
@@ -428,12 +440,21 @@ async fn iroh_create_nodes(
 }
 
 fn create_secrets(seed: u64, n: usize) -> Vec<SecretKey> {
+    // std rng is good enough for tests!
     let mut rng = rng(seed);
     (0..n)
         .map(|_| SecretKey::from_bytes(&rng.r#gen::<[u8; 32]>()))
         .collect()
 }
 
+fn create_node_ids(secrets: &[SecretKey]) -> Vec<NodeId> {
+    secrets.iter().map(|s| s.public()).collect()
+}
+
+// todo: we need a special protocol handler that validates the requester id of
+// incoming FindNode messages to be the remote node id. This is pretty
+// straightforward, but I can't write it right now because of some
+// dependency weirdness due to all the patching.
 fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
     iroh_nodes
         .iter()
@@ -456,7 +477,7 @@ async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
     let iroh_nodes = iroh_create_nodes(&secrets, bootstrap, None).await?;
     let nodes = iroh_nodes
         .iter()
-        .map(|(ep, x)| (Id::from(ep.node_id()), x.clone()))
+        .map(|(ep, x)| (ep.node_id(), x.clone()))
         .collect::<Vec<_>>();
     let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     println!("Initializing routing tables");
