@@ -68,12 +68,46 @@ fn rng(seed: u64) -> StdRng {
     StdRng::from_seed(expanded)
 }
 
+/// Choose boostrap nodes.
+///
+/// Selection indexes will be wrapped around.
+/// The node itself will never be considered.
+/// Duplicates will be removed.
+fn apply_selection(this: usize, ids: &[NodeId], selection: &[usize]) -> Vec<NodeId> {
+    let mut res = Vec::new();
+    for i in selection {
+        if *i == this {
+            continue;
+        }
+        let offset = i % ids.len();
+        let id = ids[offset];
+        if !res.contains(&id) {
+            res.push(id);
+        }
+    }
+    res
+}
+
+type Clients = Arc<Mutex<BTreeMap<NodeId, RpcClient>>>;
+
+async fn create_nodes(
+    ids: &[NodeId],
+    select_bootstrap: impl Fn(usize) -> Vec<usize>,
+    config: Config,
+) -> Nodes {
+    create_nodes_and_clients(ids, select_bootstrap, config)
+        .await
+        .0
+}
+
 /// Creates n nodes with the given seed, and at most n_bootstrap bootstrap nodes.
 ///
 /// Bootstrap nodes are just the n_bootstrap next nodes in the ring.
-async fn create_nodes(ids: &[NodeId], mut n_bootstrap: usize, config: Config) -> Nodes {
-    let n = ids.len();
-    n_bootstrap = n_bootstrap.min(n - 1);
+async fn create_nodes_and_clients(
+    ids: &[NodeId],
+    select_bootstrap: impl Fn(usize) -> Vec<usize>,
+    config: Config,
+) -> (Nodes, Clients) {
     let clients = Arc::new(Mutex::new(BTreeMap::new()));
     // create n nodes
     let nodes = ids
@@ -84,9 +118,7 @@ async fn create_nodes(ids: &[NodeId], mut n_bootstrap: usize, config: Config) ->
                 clients: clients.clone(),
                 node_id: *id,
             };
-            let bootstrap = (0..n_bootstrap)
-                .map(|i| ids[(offfset + i + 1) % n])
-                .collect::<Vec<_>>();
+            let bootstrap = apply_selection(offfset, ids, &select_bootstrap(offfset));
             (
                 *id,
                 create_node_impl(*id, pool, bootstrap, None, config.clone()),
@@ -97,7 +129,7 @@ async fn create_nodes(ids: &[NodeId], mut n_bootstrap: usize, config: Config) ->
         .lock()
         .unwrap()
         .extend(nodes.iter().map(|(id, (rpc, _))| (*id, rpc.clone())));
-    nodes
+    (nodes, clients)
 }
 
 /// Brute force init of the routing table of all nodes using a set of ids, that could be the full set.
@@ -254,18 +286,6 @@ async fn plot_random_lookup_stats(nodes: &Nodes, n: usize) -> irpc::Result<()> {
 
     let mut routing_table_size = vec![0usize; nodes.len()];
     for (index, (_, (_, api))) in nodes.iter().enumerate() {
-        let stats = api.get_storage_stats().await?;
-        if !stats.is_empty() {
-            let n = stats
-                .values()
-                .map(|kinds| kinds.values().sum::<usize>())
-                .sum::<usize>();
-            storage_count[index] = n;
-            // println!("Storage stats for node {index}: {n}");
-        }
-    }
-
-    for (index, (_, (_, api))) in nodes.iter().enumerate() {
         let routing_table = api.get_routing_table().await?;
         let count = routing_table.iter().map(|peers| peers.len()).sum::<usize>();
         // println!("Routing table {index}: {count} nodes");
@@ -306,11 +326,15 @@ fn create_buckets(ids: &[NodeId]) -> Box<Buckets> {
     routing_table.buckets
 }
 
+fn next_n(n: usize) -> impl Fn(usize) -> Vec<usize> {
+    move |offset| (1..=n).map(|i| offset + i).collect::<Vec<_>>()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_routing_1k() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 0;
+    let bootstrap = next_n(0);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -355,7 +379,7 @@ async fn no_routing_1k() {
 async fn perfect_routing_tables_1k() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 0;
+    let bootstrap = next_n(0);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -367,7 +391,7 @@ async fn perfect_routing_tables_1k() {
 async fn perfect_routing_tables_10k() {
     let n = 10000;
     let seed = 0;
-    let bootstrap = 0;
+    let bootstrap = next_n(0);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -386,7 +410,7 @@ async fn perfect_routing_tables_100k() {
     println!("{metrics:?}");
     let n = 100000;
     let seed = 0;
-    let bootstrap = 0;
+    let bootstrap = next_n(0);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -402,7 +426,7 @@ async fn perfect_routing_tables_100k() {
 async fn just_bootstrap_1k() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 20;
+    let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -414,7 +438,7 @@ async fn just_bootstrap_1k() {
 
 async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
     // bootstrap must be set so the random lookups have a chance to work!
-    let bootstrap = 20;
+    let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
@@ -547,17 +571,18 @@ async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
 async fn random_lookup_strategy() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 20;
+    let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let config = Config::default().random_lookup_strategy(RandomLookupStrategy {
         interval: Duration::from_secs(1),
+        blended: false,
     });
     let nodes = create_nodes(&ids, bootstrap, config).await;
-    for i in 0..20 {
+    for _i in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("\nAfter {i}s");
         plot_random_lookup_stats(&nodes, 100).await.ok();
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -565,17 +590,17 @@ async fn random_lookup_strategy() {
 async fn self_lookup_strategy() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 20;
+    let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let config = Config::default().self_lookup_strategy(SelfLookupStrategy {
         interval: Duration::from_secs(1),
     });
     let nodes = create_nodes(&ids, bootstrap, config).await;
-    for i in 0..20 {
+    for _i in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("\nAfter {i}s");
         plot_random_lookup_stats(&nodes, 100).await.ok();
+        println!();
     }
 }
 
@@ -583,7 +608,7 @@ async fn self_lookup_strategy() {
 async fn self_and_random_lookup_strategy() {
     let n = 1000;
     let seed = 0;
-    let bootstrap = 20;
+    let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
     let ids = create_node_ids(&secrets);
     let config = Config::default()
@@ -592,11 +617,334 @@ async fn self_and_random_lookup_strategy() {
         })
         .random_lookup_strategy(RandomLookupStrategy {
             interval: Duration::from_secs(1),
+            blended: false,
         });
     let nodes = create_nodes(&ids, bootstrap, config).await;
-    for i in 0..20 {
-        println!("\nAfter {i}s");
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+    for _i in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+        println!();
     }
+}
+
+use std::{fs::File, path::Path};
+
+use gif::{Encoder, Frame, Repeat};
+
+struct Frames {
+    data: Vec<Vec<bool>>,
+    stride: usize,
+}
+
+impl Frames {
+    fn new(stride: usize) -> Self {
+        Frames {
+            data: Vec::new(),
+            stride,
+        }
+    }
+
+    fn height(&self) -> Option<usize> {
+        let first = self.data.get(0)?;
+        assert!(
+            self.data.iter().all(|f| f.len() == first.len()),
+            "All frames must have the same length"
+        );
+        assert!(self.stride > 0, "Stride must be greater than zero");
+        assert!(
+            first.len() % self.stride == 0,
+            "Size must be a multiple of stride"
+        );
+        Some(first.len() / self.stride)
+    }
+
+    fn side_by_side(frames: &[&Frames], gap: usize) -> TestResult<Frames> {
+        let first = frames.get(0).unwrap();
+        let height = first.height().unwrap();
+        let n_frames = first.data.len();
+        assert!(
+            frames.iter().all(|f| f.stride > 0),
+            "Stride must be greater than zero"
+        );
+        assert!(
+            frames.iter().all(|f| f.height() == Some(height)),
+            "All frames must have the same height"
+        );
+        assert!(
+            frames.iter().all(|f| f.data.len() == n_frames),
+            "All frames must have the same number of frames"
+        );
+        // width of the resulting frames
+        let width = frames.iter().map(|f| f.stride).sum::<usize>() + gap * (frames.len() - 1);
+        let mut res = Frames::new(width);
+        for n_frame in 0..n_frames {
+            let mut frame = Vec::new();
+            // iterate each frame line by line. We know these iters will have the same size!
+            let mut iters = frames
+                .iter()
+                .map(|f| f.data[n_frame].chunks(f.stride))
+                .collect::<Vec<_>>();
+            for _y in 0..height {
+                for (i, iter) in iters.iter_mut().enumerate() {
+                    let line = iter.next().unwrap();
+                    if i > 0 {
+                        // add gap between frames
+                        frame.extend(std::iter::repeat(false).take(gap));
+                    }
+                    frame.extend_from_slice(line);
+                }
+            }
+            res.data.push(frame);
+        }
+        Ok(res)
+    }
+
+    fn make_gif(&self, delay_ms: u64, target: impl AsRef<Path>) -> TestResult<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let size = self.data[0].len();
+        assert!(self.stride > 0, "Stride must be greater than zero");
+        assert!(
+            size % self.stride == 0,
+            "Height must be a multiple of stride"
+        );
+        assert!(
+            self.data.iter().all(|f| f.len() == size),
+            "All frames must have the same length"
+        );
+
+        let width = self.stride;
+        let height = size / self.stride;
+
+        // Create output file
+        let mut output = File::create(target)?;
+
+        // Create encoder with a simple black/white palette
+        let palette = [0, 0, 0, 255, 255, 255]; // Black and white
+        let mut encoder = Encoder::new(&mut output, width as u16, height as u16, &palette)?;
+        encoder.set_repeat(Repeat::Infinite)?;
+
+        // Convert each bool array to a frame
+        for frame_data in &self.data {
+            // Convert bool array to indexed pixel data
+            let mut pixels = Vec::with_capacity(frame_data.len());
+            for &pixel in frame_data {
+                pixels.push(if pixel { 1u8 } else { 0 }); // 0 = black, 1 = white
+            }
+
+            // Create frame with 100ms delay (10/100 seconds)
+            let mut frame = Frame::from_indexed_pixels(width as u16, height as u16, pixels, None);
+            frame.delay = (delay_ms / 10) as u16; // Convert ms to 1/100 seconds
+
+            encoder.write_frame(&frame)?;
+        }
+
+        Ok(())
+    }
+}
+
+async fn make_frame(ids: &[NodeId], nodes: &Nodes) -> TestResult<Vec<bool>> {
+    let mut res = Vec::new();
+    for (_, (_, (_, api))) in nodes.iter().enumerate() {
+        let routing_table = api.get_routing_table().await?;
+        let node_ids = routing_table
+            .iter()
+            .flat_map(|peers| peers.iter().map(|x| x.id))
+            .collect::<HashSet<_>>();
+        res.extend(ids.iter().map(|id| node_ids.contains(id)));
+    }
+    Ok(res)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_1k() -> TestResult<()> {
+    let n = 1000;
+    let k = 900;
+    let seed = 0;
+    let bootstrap = |i| {
+        if i < k {
+            // nodes below k form a ring
+            (1..=20).map(|j| (i + j) % k).collect::<Vec<_>>()
+        } else {
+            // nodes above k don't have bootstrap peers
+            vec![]
+        }
+    };
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    // all nodes have all the strategies enabled
+    let config = Config::persistent()
+        .self_lookup_strategy(SelfLookupStrategy {
+            interval: Duration::from_secs(1),
+        })
+        .random_lookup_strategy(RandomLookupStrategy {
+            interval: Duration::from_secs(1),
+            blended: false,
+        })
+        .candidate_lookup_strategy(CandidateLookupStrategy {
+            max_lookups: 1,
+            interval: Duration::from_secs(1),
+        });
+    let (nodes, _clients) = create_nodes_and_clients(&ids, bootstrap, config).await;
+    let mut frames = Vec::new();
+    for _i in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+        frames.push(make_frame(&ids, &nodes).await?);
+        println!();
+    }
+    let id0 = nodes[0].0;
+    // tell the partitioned nodes about id0
+    for i in k..n {
+        let (_, (_, api)) = &nodes[i];
+        api.nodes_seen(&[id0]).await.ok();
+    }
+    let mut frames = Frames::new(n);
+    for _i in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        plot_random_lookup_stats(&nodes, 100).await.ok();
+        let last_id = nodes.last().unwrap().0;
+        let mut knows_last_id = 0;
+        for (_, (_, (_, api))) in nodes.iter().enumerate() {
+            let routing_table = api.get_routing_table().await?;
+            knows_last_id += routing_table
+                .iter()
+                .map(|peers| peers.iter().filter(|x| x.id == last_id).count())
+                .sum::<usize>();
+        }
+        frames.data.push(make_frame(&ids, &nodes).await?);
+        println!("Nodes that know about last_id: {knows_last_id}");
+    }
+    frames.make_gif(100, "partition_1k.gif")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_1k() -> TestResult<()> {
+    let n = 1000;
+    let k = 900;
+    let seed = 0;
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    // all nodes have all the strategies enabled
+    let config = Config::persistent()
+        .self_lookup_strategy(SelfLookupStrategy {
+            interval: Duration::from_secs(1),
+        })
+        .random_lookup_strategy(RandomLookupStrategy {
+            interval: Duration::from_secs(1),
+            blended: false,
+        })
+        .candidate_lookup_strategy(CandidateLookupStrategy {
+            max_lookups: 1,
+            interval: Duration::from_secs(1),
+        });
+    let (nodes, clients) = create_nodes_and_clients(&ids, next_n(20), config).await;
+    let mut frames = Frames {
+        data: Vec::new(),
+        stride: n,
+    };
+    for _i in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        frames.data.push(make_frame(&ids, &nodes).await?);
+        println!();
+    }
+    for i in k..n {
+        clients.lock().unwrap().remove(&ids[i]);
+    }
+    for _i in 0..40 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        frames.data.push(make_frame(&ids, &nodes).await?);
+        println!();
+    }
+    frames.make_gif(100, "remove_1k.gif")?;
+    Ok(())
+}
+
+async fn trigger_random_lookups(nodes: &Nodes) {
+    stream::iter(nodes.iter())
+        .for_each_concurrent(512, |(_, (_, api))| async move {
+            api.random_lookup().await;
+        })
+        .await;
+}
+
+/// Compares random and blended random lookups with 1000 nodes over 60 seconds
+#[tokio::test(flavor = "multi_thread")]
+async fn random_vs_blended_1k() -> TestResult<()> {
+    let n = 1000;
+    let seed = 0;
+    let n_frames = 50;
+    let secrets = create_secrets(seed, n);
+    let ids = create_node_ids(&secrets);
+    let random = {
+        // all nodes have all the strategies enabled
+        let config = Config::persistent().random_lookup_strategy(RandomLookupStrategy {
+            // disable time based lookups
+            interval: Duration::MAX,
+            blended: false,
+        });
+        let nodes = create_nodes(&ids, next_n(20), config).await;
+        let mut frames = Frames {
+            data: Vec::new(),
+            stride: n,
+        };
+        for _i in 0..n_frames {
+            frames.data.push(make_frame(&ids, &nodes).await?);
+            trigger_random_lookups(&nodes).await;
+            println!();
+        }
+        frames
+    };
+    let blended = {
+        // all nodes have all the strategies enabled
+        let config = Config::persistent()
+            // .self_lookup_strategy(SelfLookupStrategy {
+            //     interval: Duration::from_secs(1),
+            // })
+            .random_lookup_strategy(RandomLookupStrategy {
+                // disable time based lookups
+                interval: Duration::MAX,
+                blended: true,
+            });
+        let nodes = create_nodes(&ids, next_n(20), config).await;
+        let mut frames = Frames {
+            data: Vec::new(),
+            stride: n,
+        };
+        for _i in 0..n_frames {
+            frames.data.push(make_frame(&ids, &nodes).await?);
+            trigger_random_lookups(&nodes).await;
+            println!();
+        }
+        frames
+    };
+    let perfect = {
+        // all nodes have all the strategies enabled
+        let config = Config::persistent()
+            // .self_lookup_strategy(SelfLookupStrategy {
+            //     interval: Duration::from_secs(1),
+            // })
+            .random_lookup_strategy(RandomLookupStrategy {
+                // disable time based lookups
+                interval: Duration::MAX,
+                blended: true,
+            });
+        let nodes = create_nodes(&ids, next_n(20), config).await;
+        init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
+        let mut frames = Frames {
+            data: Vec::new(),
+            stride: n,
+        };
+        for _i in 0..n_frames {
+            frames.data.push(make_frame(&ids, &nodes).await?);
+            // trigger_random_lookups(&nodes).await;
+            println!();
+        }
+        frames
+    };
+    let frames = Frames::side_by_side(&[&random, &blended, &perfect], 20)?;
+    frames.make_gif(100, "random_vs_blended_1k.gif")?;
+    Ok(())
 }

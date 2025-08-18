@@ -27,4 +27,5 @@ iroh-connection-pool = { git = "https://github.com/n0-computer/iroh-experiments"
 iroh = { git = "https://github.com/n0-computer/iroh", branch = "connection-speed-test" }
 
 [dev-dependencies]
+gif = "0.13.3"
 testresult = "0.4.1"

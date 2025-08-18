@@ -776,8 +776,9 @@ mod routing {
 use crate::{
     api::{ApiMessage, Lookup, NetworkGet, NetworkPut},
     pool::{ClientPool, PoolError},
-    routing::{ALPHA, Buckets, Distance, K, NodeInfo, RoutingTable},
+    routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, NodeInfo, RoutingTable},
     rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
+    u256::U256,
 };
 
 struct Node {
@@ -813,6 +814,171 @@ impl MemStorage {
     /// Get all values of a certain kind for a key.
     fn get_all(&self, key: &Id, kind: &Kind) -> Option<&IndexSet<Value>> {
         self.data.get(key).and_then(|kinds| kinds.get(kind))
+    }
+}
+
+mod u256 {
+    use std::ops::{BitAnd, BitOr, BitXor, Deref, Not, Shl, Shr};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U256([u8; 32]);
+
+    impl Deref for U256 {
+        type Target = [u8; 32];
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl U256 {
+        /// Minimum value (all zeros)
+        pub const MIN: U256 = U256([0u8; 32]);
+
+        /// Maximum value (all ones)
+        pub const MAX: U256 = U256([0xffu8; 32]);
+
+        /// Create a new U256 from a byte array (little-endian)
+        pub fn from_le_bytes(bytes: [u8; 32]) -> Self {
+            U256(bytes)
+        }
+
+        /// Get the underlying byte array (little-endian)
+        pub fn to_le_bytes(&self) -> [u8; 32] {
+            self.0
+        }
+
+        /// Get the number of leading zeros
+        pub fn leading_zeros(&self) -> u32 {
+            let mut count = 0;
+            for &byte in self.0.iter().rev() {
+                if byte == 0 {
+                    count += 8;
+                } else {
+                    count += byte.leading_zeros();
+                    break;
+                }
+            }
+            count
+        }
+    }
+
+    // Bitwise XOR
+    impl BitXor for U256 {
+        type Output = Self;
+
+        fn bitxor(self, rhs: Self) -> Self::Output {
+            let mut result = [0u8; 32];
+            for i in 0..32 {
+                result[i] = self.0[i] ^ rhs.0[i];
+            }
+            U256(result)
+        }
+    }
+
+    // Bitwise AND
+    impl BitAnd for U256 {
+        type Output = Self;
+
+        fn bitand(self, rhs: Self) -> Self::Output {
+            let mut result = [0u8; 32];
+            for i in 0..32 {
+                result[i] = self.0[i] & rhs.0[i];
+            }
+            U256(result)
+        }
+    }
+
+    // Bitwise OR
+    impl BitOr for U256 {
+        type Output = Self;
+
+        fn bitor(self, rhs: Self) -> Self::Output {
+            let mut result = [0u8; 32];
+            for i in 0..32 {
+                result[i] = self.0[i] | rhs.0[i];
+            }
+            U256(result)
+        }
+    }
+
+    // Bitwise NOT
+    impl Not for U256 {
+        type Output = Self;
+
+        fn not(self) -> Self::Output {
+            let mut result = [0u8; 32];
+            for i in 0..32 {
+                result[i] = !self.0[i];
+            }
+            U256(result)
+        }
+    }
+
+    // Left shift without wraparound
+    impl Shl<u32> for U256 {
+        type Output = Self;
+
+        fn shl(self, rhs: u32) -> Self::Output {
+            if rhs >= 256 {
+                return U256::MIN;
+            }
+
+            // Split into two u128 values (little-endian)
+            let low = u128::from_le_bytes(self.0[0..16].try_into().unwrap());
+            let high = u128::from_le_bytes(self.0[16..32].try_into().unwrap());
+
+            let (new_low, new_high) = if rhs >= 128 {
+                // Shift more than 128 bits: low becomes 0, high gets low shifted
+                let shift_amount = rhs - 128;
+                (0, low << shift_amount)
+            } else {
+                // Normal shift: both parts get shifted, with overflow from low to high
+                let overflow_bits = 128 - rhs;
+                let new_low = low << rhs;
+                let new_high = (high << rhs) | (low >> overflow_bits);
+                (new_low, new_high)
+            };
+
+            let mut result = [0u8; 32];
+            result[0..16].copy_from_slice(&new_low.to_le_bytes());
+            result[16..32].copy_from_slice(&new_high.to_le_bytes());
+
+            U256(result)
+        }
+    }
+
+    // Right shift without wraparound
+    impl Shr<u32> for U256 {
+        type Output = Self;
+
+        fn shr(self, rhs: u32) -> Self::Output {
+            if rhs >= 256 {
+                return U256::MIN;
+            }
+
+            // Split into two u128 values (little-endian)
+            let low = u128::from_le_bytes(self.0[0..16].try_into().unwrap());
+            let high = u128::from_le_bytes(self.0[16..32].try_into().unwrap());
+
+            let (new_low, new_high) = if rhs >= 128 {
+                // Shift more than 128 bits: high becomes 0, low gets high shifted
+                let shift_amount = rhs - 128;
+                (high >> shift_amount, 0)
+            } else {
+                // Normal shift: both parts get shifted, with overflow from high to low
+                let overflow_bits = 128 - rhs;
+                let new_low = (low >> rhs) | (high << overflow_bits);
+                let new_high = high >> rhs;
+                (new_low, new_high)
+            };
+
+            let mut result = [0u8; 32];
+            result[0..16].copy_from_slice(&new_low.to_le_bytes());
+            result[16..32].copy_from_slice(&new_high.to_le_bytes());
+
+            U256(result)
+        }
     }
 }
 
@@ -1037,14 +1203,34 @@ pub struct Config {
     parallelism: usize,
     /// Whether the requester is a transient node.
     transient: bool,
-    /// Random lookup strategy.
-    random_lookup_strategy: Option<RandomLookupStrategy>,
-    /// Self lookup strategy.
-    self_lookup_strategy: Option<SelfLookupStrategy>,
-    /// Candidate lookup strategy.
-    candidate_lookup_strategy: Option<CandidateLookupStrategy>,
     /// Random number generator seed.
     rng_seed: Option<[u8; 32]>,
+    /// Lookup strategies.
+    lookup_strategies: LookupStrategies,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LookupStrategies {
+    /// Random lookup strategy.
+    random: Option<RandomLookupStrategy>,
+    /// Self lookup strategy.
+    self_id: Option<SelfLookupStrategy>,
+    /// Candidate lookup strategy.
+    candidate: Option<CandidateLookupStrategy>,
+}
+
+impl LookupStrategies {
+    /// No lookup strategies.
+    ///
+    /// This is good for testing, since it allows you to trigger lookups
+    /// manually. But don't use this in prod!
+    pub fn none() -> Self {
+        Self {
+            random: None,
+            self_id: None,
+            candidate: None,
+        }
+    }
 }
 
 /// This is the mechanism for adding new nodes to a DHT.
@@ -1079,6 +1265,7 @@ pub struct SelfLookupStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RandomLookupStrategy {
     interval: Duration,
+    blended: bool,
 }
 
 impl Config {
@@ -1101,17 +1288,17 @@ impl Config {
     }
 
     pub fn candidate_lookup_strategy(mut self, value: CandidateLookupStrategy) -> Self {
-        self.candidate_lookup_strategy = Some(value);
+        self.lookup_strategies.candidate = Some(value);
         self
     }
 
     pub fn random_lookup_strategy(mut self, value: RandomLookupStrategy) -> Self {
-        self.random_lookup_strategy = Some(value);
+        self.lookup_strategies.random = Some(value);
         self
     }
 
     pub fn self_lookup_strategy(mut self, value: SelfLookupStrategy) -> Self {
-        self.self_lookup_strategy = Some(value);
+        self.lookup_strategies.self_id = Some(value);
         self
     }
 }
@@ -1123,9 +1310,11 @@ impl Default for Config {
             alpha: ALPHA,
             parallelism: 4,
             transient: true,
-            candidate_lookup_strategy: None,
-            random_lookup_strategy: None,
-            self_lookup_strategy: None,
+            lookup_strategies: LookupStrategies {
+                random: None,
+                self_id: None,
+                candidate: None,
+            },
             rng_seed: None,
         }
     }
@@ -1174,7 +1363,8 @@ where
                 tasks,
                 state,
                 candidates: config
-                    .candidate_lookup_strategy
+                    .lookup_strategies
+                    .candidate
                     .map(|s| Candidates::new(s.max_lookups * config.k)),
                 rng: config
                     .rng_seed
@@ -1284,7 +1474,18 @@ where
                 });
             }
             ApiMessage::RandomLookup(msg) => {
-                let id = Id::from(self.rng.r#gen::<[u8; 32]>());
+                // bucket up to which the node should overlap with self.
+                // 0 is fully random, 256 is just self.
+                let blended = false;
+                let id = if blended {
+                    let bucket = self.rng.gen_range::<u32, _>(0..BUCKET_COUNT as u32 + 2);
+                    let this = U256::from_le_bytes(*self.node.id.as_bytes());
+                    let random = U256::from_le_bytes(self.rng.r#gen());
+                    let res = blend(this, random, bucket);
+                    Id::from(res.to_le_bytes())
+                } else {
+                    Id::from(self.rng.r#gen::<[u8; 32]>())
+                };
                 let api = self.state.api.clone();
                 self.tasks.spawn(async move {
                     api.lookup(id, None).await.ok();
@@ -1292,7 +1493,7 @@ where
                 });
             }
             ApiMessage::CandidateLookup(msg) => {
-                if self.state.config.candidate_lookup_strategy.is_none() {
+                if self.state.config.lookup_strategies.candidate.is_none() {
                     warn!(
                         "Received CandidateLookup request, but no candidate lookup strategy is configured"
                     );
@@ -1573,15 +1774,15 @@ impl<P: ClientPool> State<P> {
         let mut self_lookup = MaybeFuture::None;
         let mut random_lookup = MaybeFuture::None;
         let mut candidate_lookup = MaybeFuture::None;
-        if let Some(strategy) = &self.config.self_lookup_strategy {
+        if let Some(strategy) = &self.config.lookup_strategies.self_id {
             let api = self.api.clone();
             self_lookup = MaybeFuture::Some(api.self_lookup_periodic(strategy.interval));
         }
-        if let Some(strategy) = &self.config.random_lookup_strategy {
+        if let Some(strategy) = &self.config.lookup_strategies.random {
             let api = self.api.clone();
             random_lookup = MaybeFuture::Some(api.random_lookup_periodic(strategy.interval));
         }
-        if let Some(strategy) = &self.config.candidate_lookup_strategy {
+        if let Some(strategy) = &self.config.lookup_strategies.candidate {
             let api = self.api.clone();
             candidate_lookup = MaybeFuture::Some(api.candidate_lookup_periodic(strategy.interval));
         }
@@ -1597,6 +1798,24 @@ impl<P: ClientPool> State<P> {
             }
         }
     }
+}
+
+/// Blend two values.
+///
+/// n is the number of bits different from a
+/// n=0, just a
+/// n=1, smallest bit is different from a
+/// n=2, second smallest bit is different from a, smallest bit is from b
+/// n=256, highest bit is different from a, all others from b
+/// n>256, just b
+fn blend(a: U256, b: U256, n: u32) -> U256 {
+    if n >= 256 {
+        return b;
+    }
+    let a_mask = U256::MAX << n;
+    let b_mask = (!a_mask) >> 1;
+    let xor_mask = !(a_mask | b_mask);
+    a & a_mask | a ^ xor_mask | b & b_mask
 }
 
 fn now() -> u64 {
