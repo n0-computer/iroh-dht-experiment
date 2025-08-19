@@ -23,23 +23,15 @@ struct TestPool {
 }
 
 impl ClientPool for TestPool {
-    async fn with_client<F, Fut, R, E>(&self, id: NodeId, f: F) -> Result<R, E>
-    where
-        F: FnOnce(RpcClient) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-        R: Send + 'static,
-        E: From<PoolError>,
-    {
+    async fn client(&self, id: NodeId) -> Result<RpcClient, String> {
         let client = self
             .clients
             .lock()
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or(E::from(PoolError {
-                message: "client not found".into(),
-            }))?;
-        f(client).await
+            .ok_or_else(|| format!("client not found: {}", id))?;
+        Ok(client)
     }
 
     fn id(&self) -> NodeId {
