@@ -406,8 +406,6 @@ async fn perfect_routing_tables_10k() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "runs very long and takes ~20GiB"]
 async fn perfect_routing_tables_100k() {
-    let metrics = tokio::runtime::Handle::current().metrics();
-    println!("{metrics:?}");
     let n = 100000;
     let seed = 0;
     let bootstrap = next_n(0);
@@ -547,6 +545,7 @@ fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
+    tracing_subscriber::fmt::try_init().ok();
     let n = 500;
     let seed = 0;
     let bootstrap = 0;

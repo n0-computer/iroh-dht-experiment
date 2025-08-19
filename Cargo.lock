@@ -621,6 +621,7 @@ dependencies = [
  "textplots",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1478,7 +1479,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "0.91.1"
-source = "git+https://github.com/n0-computer/iroh?branch=connection-speed-test#0248015cb663bc1b90faa4a6390b5e9aa2a5ef3f"
+source = "git+https://github.com/n0-computer/iroh?branch=connection-speed-test#fe902c9c39f8e22a4e13e722475c0c9b4f204fce"
 dependencies = [
  "aead",
  "backon",
