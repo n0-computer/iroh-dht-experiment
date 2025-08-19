@@ -69,6 +69,7 @@
 //! [irpc blog post]: https://www.iroh.computer/blog/irpc/
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -79,7 +80,6 @@ use irpc::channel::{mpsc, oneshot};
 use n0_future::{BufferedStreamExt, MaybeFuture, StreamExt, stream};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::index::sample};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
 use tokio::task::JoinSet;
 #[cfg(test)]
 mod tests;
@@ -95,7 +95,12 @@ pub mod rpc {
     //! message type [`RpcMessage`].
     //!
     //! The entry point is [`RpcClient`].
-    use std::{fmt, num::NonZeroU64, ops::Deref};
+    use std::{
+        fmt,
+        num::NonZeroU64,
+        ops::Deref,
+        sync::{Arc, Weak},
+    };
 
     use iroh::{Endpoint, NodeAddr, NodeId, PublicKey};
     use iroh_base::SignatureError;
@@ -304,17 +309,26 @@ pub mod rpc {
     }
 
     #[derive(Debug, Clone)]
-    pub struct RpcClient(pub(crate) irpc::Client<RpcProto>);
+    pub struct RpcClient(pub(crate) Arc<irpc::Client<RpcProto>>);
+
+    #[derive(Debug, Clone)]
+    pub struct WeakRpcClient(pub(crate) Weak<irpc::Client<RpcProto>>);
+
+    impl WeakRpcClient {
+        pub fn upgrade(&self) -> Option<RpcClient> {
+            self.0.upgrade().map(RpcClient)
+        }
+    }
 
     impl RpcClient {
         pub fn remote(endpoint: Endpoint, id: Id) -> std::result::Result<Self, SignatureError> {
             let id = iroh::NodeId::from_bytes(&id)?;
             let client = irpc_iroh::client(endpoint, id, ALPN);
-            Ok(Self(client))
+            Ok(Self::new(client))
         }
 
         pub fn new(client: irpc::Client<RpcProto>) -> Self {
-            Self(client)
+            Self(Arc::new(client))
         }
 
         pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
@@ -340,6 +354,10 @@ pub mod rpc {
         ) -> irpc::Result<Vec<NodeAddr>> {
             self.0.rpc(FindNode { id, requester }).await
         }
+
+        pub fn downgrade(&self) -> WeakRpcClient {
+            WeakRpcClient(Arc::downgrade(&self.0))
+        }
     }
 }
 
@@ -352,7 +370,12 @@ pub mod api {
     //! message type [`ApiMessage`].
     //!
     //! The entry point is [`ApiClient`].
-    use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroU64,
+        sync::{Arc, Weak},
+        time::Duration,
+    };
 
     use iroh::NodeId;
     use irpc::{
@@ -410,7 +433,7 @@ pub mod api {
     }
 
     #[derive(Debug, Clone)]
-    pub struct ApiClient(pub(crate) irpc::Client<ApiProto>);
+    pub struct ApiClient(pub(crate) Arc<irpc::Client<ApiProto>>);
 
     impl ApiClient {
         /// notify the node that we have just seen these nodes.
@@ -513,38 +536,71 @@ pub mod api {
             self.0.rpc(SelfLookup).await.ok();
         }
 
-        pub(crate) async fn self_lookup_periodic(self, interval: Duration) {
-            loop {
-                tokio::time::sleep(interval).await;
-                self.self_lookup().await;
-            }
-        }
-
         pub async fn random_lookup(&self) {
             self.0.rpc(RandomLookup).await.ok();
-        }
-
-        pub(crate) async fn random_lookup_periodic(self, interval: Duration) {
-            loop {
-                tokio::time::sleep(interval).await;
-                self.random_lookup().await;
-            }
         }
 
         pub async fn candidate_lookup(&self) {
             self.0.rpc(CandidateLookup).await.ok();
         }
 
+        pub fn downgrade(&self) -> WeakApiClient {
+            WeakApiClient(Arc::downgrade(&self.0))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct WeakApiClient(pub(crate) Weak<irpc::Client<ApiProto>>);
+
+    impl WeakApiClient {
+        pub fn upgrade(&self) -> irpc::Result<ApiClient> {
+            self.0
+                .upgrade()
+                .map(ApiClient)
+                .ok_or(irpc::Error::Send(irpc::channel::SendError::ReceiverClosed))
+        }
+
+        pub async fn nodes_dead(&self, ids: &[NodeId]) -> irpc::Result<()> {
+            self.upgrade()?.nodes_dead(ids).await
+        }
+
+        pub async fn nodes_seen(&self, ids: &[NodeId]) -> irpc::Result<()> {
+            self.upgrade()?.nodes_seen(ids).await
+        }
+
+        pub(crate) async fn self_lookup_periodic(self, interval: Duration) {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Ok(api) = self.upgrade() else {
+                    return;
+                };
+                api.self_lookup().await;
+            }
+        }
+
+        pub(crate) async fn random_lookup_periodic(self, interval: Duration) {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Ok(api) = self.upgrade() else {
+                    return;
+                };
+                api.random_lookup().await;
+            }
+        }
+
         pub(crate) async fn candidate_lookup_periodic(self, interval: Duration) {
             loop {
-                self.candidate_lookup().await;
                 tokio::time::sleep(interval).await;
+                let Ok(api) = self.upgrade() else {
+                    return;
+                };
+                api.candidate_lookup().await;
             }
         }
     }
 }
 pub use api::ApiClient;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 mod routing {
     use std::{
@@ -774,8 +830,8 @@ mod routing {
 }
 
 use crate::{
-    api::{ApiMessage, Lookup, NetworkGet, NetworkPut},
-    pool::{ClientPool, PoolError},
+    api::{ApiMessage, Lookup, NetworkGet, NetworkPut, WeakApiClient},
+    pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, NodeInfo, RoutingTable},
     rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     u256::U256,
@@ -849,6 +905,7 @@ mod u256 {
         }
 
         /// Get the number of leading zeros
+        #[allow(dead_code)]
         pub fn leading_zeros(&self) -> u32 {
             let mut count = 0;
             for &byte in self.0.iter().rev() {
@@ -988,15 +1045,17 @@ pub mod pool {
     //! This can be implemented with an in-memory implementation for tests,
     //! and with a proper iroh connection pool for real use.
 
+    use std::sync::{Arc, RwLock};
+
     use iroh::{
         Endpoint, NodeAddr, NodeId,
-        endpoint::{Connection, RecvStream, SendStream},
+        endpoint::{RecvStream, SendStream},
     };
-    use iroh_connection_pool::connection_pool::ConnectionPool;
+    use iroh_connection_pool::connection_pool::{ConnectionPool, ConnectionRef};
     use snafu::Snafu;
-    use tracing::trace;
+    use tracing::error;
 
-    use crate::rpc::RpcClient;
+    use crate::rpc::{RpcClient, WeakRpcClient};
 
     /// A pool that can efficiently provide clients given a node id, and knows its
     /// own identity.
@@ -1023,16 +1082,7 @@ pub mod pool {
         ///
         /// You must not clone the client out of the closure. If you do, this client
         /// can become unusable at any time!
-        fn with_client<F, Fut, R, E>(
-            &self,
-            id: NodeId,
-            f: F,
-        ) -> impl Future<Output = Result<R, E>> + Send
-        where
-            F: FnOnce(RpcClient) -> Fut + Send + 'static,
-            Fut: Future<Output = Result<R, E>> + Send + 'static,
-            R: Send + 'static,
-            E: From<PoolError> + Send + 'static;
+        fn client(&self, id: NodeId) -> impl Future<Output = Result<RpcClient, String>> + Send;
     }
 
     /// Error when a pool can not obtain a client.
@@ -1045,16 +1095,33 @@ pub mod pool {
     pub struct IrohPool {
         endpoint: Endpoint,
         inner: ConnectionPool,
+        self_client: Arc<RwLock<Option<WeakRpcClient>>>,
     }
 
     impl IrohPool {
         pub fn new(endpoint: Endpoint, inner: ConnectionPool) -> Self {
-            Self { endpoint, inner }
+            Self {
+                endpoint,
+                inner,
+                self_client: Arc::new(RwLock::new(None)),
+            }
+        }
+
+        /// Iroh connections to self are not allowed. But when storing or getting values,
+        /// it is perfectly reasonable to have the own id as the best location.
+        ///
+        /// To support this seamlessly, this allows creating a client to self.
+        ///
+        /// This has to be a weak client since we don't want the pool, which is owned by the
+        /// node actor, to keep the node actor alive.
+        pub fn set_self_client(&self, client: Option<WeakRpcClient>) {
+            let mut self_client = self.self_client.write().unwrap();
+            *self_client = client;
         }
     }
 
     #[derive(Debug, Clone)]
-    struct IrohConnection(Connection);
+    struct IrohConnection(Arc<ConnectionRef>);
 
     impl irpc::rpc::RemoteConnection for IrohConnection {
         fn clone_boxed(&self) -> Box<dyn irpc::rpc::RemoteConnection> {
@@ -1105,28 +1172,26 @@ pub mod pool {
             self.endpoint.add_node_addr_with_source(addr, "").ok();
         }
 
-        async fn with_client<F, Fut, R, E>(&self, node_id: NodeId, f: F) -> Result<R, E>
-        where
-            F: FnOnce(RpcClient) -> Fut + Send + 'static,
-            Fut: Future<Output = Result<R, E>> + Send + 'static,
-            R: Send + 'static,
-            E: From<PoolError> + Send + 'static,
-        {
-            trace!(%node_id, "Connecting");
-            let res = self
+        async fn client(&self, node_id: NodeId) -> Result<RpcClient, String> {
+            if node_id == self.id() {
+                // If we are trying to connect to ourselves, return the self client if available.
+                if let Some(client) = self.self_client.read().unwrap().clone() {
+                    return client
+                        .upgrade()
+                        .ok_or_else(|| "Self client is no longer available".to_string());
+                } else {
+                    error!("Self client not set");
+                    return Err("Self client not set".to_string());
+                }
+            }
+            let connection = self
                 .inner
-                .with_connection(node_id, move |conn| async move {
-                    trace!(%node_id, "Got connection");
-                    let client = RpcClient(irpc::Client::boxed(IrohConnection(conn)));
-                    f(client).await
-                })
-                .await;
-            res.map_err(|_| PoolError {
-                message: "Connection pool shut down".into(),
-            })?
-            .map_err(|e| PoolError {
-                message: format!("Failed to obtain client: {}", e),
-            })?
+                .connect(node_id)
+                .await
+                .map_err(|e| format!("Failed to connect: {}", e));
+            let connection = connection?;
+            let client = RpcClient::new(irpc::Client::boxed(IrohConnection(Arc::new(connection))));
+            Ok(client)
         }
     }
 }
@@ -1135,7 +1200,7 @@ pub mod pool {
 #[derive(Debug, Clone)]
 struct State<P> {
     /// ability to send messages to ourselves, e.g. to update the routing table
-    api: ApiClient,
+    api: WeakApiClient,
     /// client pool
     pool: P,
     /// configuration
@@ -1320,22 +1385,6 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Snafu)]
-enum Error {
-    #[snafu(transparent)]
-    Client { source: PoolError },
-    #[snafu(transparent)]
-    Irpc { source: irpc::Error },
-}
-
-impl From<irpc::channel::SendError> for Error {
-    fn from(source: irpc::channel::SendError) -> Self {
-        Self::Irpc {
-            source: irpc::Error::from(source),
-        }
-    }
-}
-
 impl<P> Actor<P>
 where
     P: ClientPool,
@@ -1347,10 +1396,10 @@ where
         config: Config,
     ) -> (Self, ApiClient) {
         let (api_tx, internal_rx) = tokio::sync::mpsc::channel(32);
-        let api = ApiClient(api_tx.into());
+        let api = ApiClient(Arc::new(api_tx.into()));
         let mut tasks = JoinSet::new();
         let state = State {
-            api: api.clone(),
+            api: api.downgrade(),
             pool,
             config: config.clone(),
         };
@@ -1469,6 +1518,9 @@ where
                 // the self lookup won't be very useful.
                 let api = self.state.api.clone();
                 self.tasks.spawn(async move {
+                    let Ok(api) = api.upgrade() else {
+                        return;
+                    };
                     api.lookup(id, None).await.ok();
                     msg.tx.send(()).await.ok();
                 });
@@ -1488,6 +1540,9 @@ where
                 };
                 let api = self.state.api.clone();
                 self.tasks.spawn(async move {
+                    let Ok(api) = api.upgrade() else {
+                        return;
+                    };
                     api.lookup(id, None).await.ok();
                     msg.tx.send(()).await.ok();
                 });
@@ -1516,6 +1571,9 @@ where
                     })
                     .collect::<Vec<_>>();
                 self.tasks.spawn(async move {
+                    let Ok(api) = api.upgrade() else {
+                        return;
+                    };
                     // this will check if they exist. If yes, they will be added to the routing table.
                     for (id, ids) in groups {
                         api.lookup(id, Some(ids)).await.ok();
@@ -1634,14 +1692,13 @@ impl<P: ClientPool> State<P> {
                 let value = msg.value.clone();
                 let tx = tx.clone();
                 async move {
-                    pool.with_client(id, move |client| async move {
-                        if client.set(msg.id, value).await.is_ok() {
-                            tx.send(id).await?;
-                        }
-                        std::result::Result::<(), Error>::Ok(())
-                    })
-                    .await
-                    .ok();
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    if client.set(msg.id, value).await.is_ok() {
+                        tx.send(id).await.ok();
+                    }
+                    drop(client);
                 }
             })
             .await;
@@ -1665,16 +1722,19 @@ impl<P: ClientPool> State<P> {
                     n: msg.n,
                 };
                 async move {
-                    pool.with_client(id, move |client| async move {
-                        // Get all values of the specified kind for the key
-                        let mut rx = client.get_all(msg.id, msg.kind, msg.seed, msg.n).await?;
-                        while let Ok(Some(value)) = rx.recv().await {
-                            tx.send((id, value)).await?;
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    // Get all values of the specified kind for the key
+                    let Ok(mut rx) = client.get_all(msg.id, msg.kind, msg.seed, msg.n).await else {
+                        return;
+                    };
+                    while let Ok(Some(value)) = rx.recv().await {
+                        if tx.send((id, value)).await.is_err() {
+                            break;
                         }
-                        std::result::Result::<(), Error>::Ok(())
-                    })
-                    .await
-                    .ok();
+                    }
+                    drop(client);
                 }
             })
             .await;
@@ -1686,14 +1746,22 @@ impl<P: ClientPool> State<P> {
         } else {
             Some(self.pool.id())
         };
-        let infos = self
+
+        let client = self
             .pool
-            .with_client(id, move |client| async move {
-                let ids = client.find_node(target, requester).await?;
-                std::result::Result::<Vec<_>, Error>::Ok(ids)
-            })
+            .client(id)
             .await
-            .map_err(|_| "Failed to query node")?;
+            .map_err(|_| "Error getting client")?;
+        let infos = client
+            .find_node(target, requester)
+            .await
+            .map_err(|_| "Failed to query node");
+        if let Err(e) = &infos {
+            info!(%id, "Failed to query node: {e}");
+            return Err("Failed to query node");
+        }
+        let infos = infos?;
+        drop(client);
         let ids = infos.iter().map(|info| info.node_id).collect();
         for info in infos {
             self.pool.add_node_addr(info);
@@ -1856,5 +1924,5 @@ fn create_node_impl<P: ClientPool>(
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let (actor, api) = Actor::<P>::new(node, rx, pool, config);
     tokio::spawn(actor.run());
-    (RpcClient(irpc::Client::local(tx)), api)
+    (RpcClient::new(irpc::Client::local(tx)), api)
 }

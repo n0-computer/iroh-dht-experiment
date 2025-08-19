@@ -1575,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "iroh-connection-pool"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-experiments?branch=handler-pool#2ba54259497187ef8d7e6a4488882045e1366ee1"
+source = "git+https://github.com/n0-computer/iroh-experiments?branch=handler-pool#048052f7a9d85e7f6e9756824679c5603a19b7fd"
 dependencies = [
  "iroh",
  "n0-future 0.2.0",

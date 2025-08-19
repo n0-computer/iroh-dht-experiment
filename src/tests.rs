@@ -23,23 +23,15 @@ struct TestPool {
 }
 
 impl ClientPool for TestPool {
-    async fn with_client<F, Fut, R, E>(&self, id: NodeId, f: F) -> Result<R, E>
-    where
-        F: FnOnce(RpcClient) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-        R: Send + 'static,
-        E: From<PoolError>,
-    {
+    async fn client(&self, id: NodeId) -> Result<RpcClient, String> {
         let client = self
             .clients
             .lock()
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or(E::from(PoolError {
-                message: "client not found".into(),
-            }))?;
-        f(client).await
+            .ok_or_else(|| format!("client not found: {}", id))?;
+        Ok(client)
     }
 
     fn id(&self) -> NodeId {
@@ -206,7 +198,7 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         if nodes.len() > 10000 {
-            println!("{i}");
+            println!("Value {i}");
         }
         let text = format!("Item {i}");
         let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
@@ -491,21 +483,28 @@ async fn iroh_create_nodes(
                     .await?;
                 let addr = endpoint.node_addr().initialized().await;
                 discovery.add_node_info(addr.clone());
-                let pool = ConnectionPool::new(endpoint.clone(), DHT_TEST_ALPN, Default::default());
+                let pool = ConnectionPool::new(
+                    endpoint.clone(),
+                    DHT_TEST_ALPN,
+                    iroh_connection_pool::connection_pool::Options {
+                        max_connections: 32,
+                        idle_timeout: Duration::from_secs(1),
+                        connect_timeout: Duration::from_secs(1),
+                    },
+                );
                 let pool = IrohPool::new(endpoint.clone(), pool);
                 let bootstrap = (0..n_bootstrap)
                     .map(|i| node_ids[(offfset + i + 1) % n])
                     .collect::<Vec<_>>();
-                Ok((
-                    endpoint,
-                    create_node_impl(
-                        *node_id,
-                        pool,
-                        bootstrap,
-                        (*buckets).clone(),
-                        Default::default(),
-                    ),
-                ))
+                let (rpc, api) = create_node_impl(
+                    *node_id,
+                    pool.clone(),
+                    bootstrap,
+                    (*buckets).clone(),
+                    Default::default(),
+                );
+                pool.set_self_client(Some(rpc.downgrade()));
+                Ok((endpoint, (rpc, api)))
             }
         })
         .buffered_unordered(32)
@@ -542,11 +541,7 @@ fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
         })
         .collect()
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
-    let n = 500;
+async fn iroh_perfect_routing_tables(n: usize) -> TestResult<()> {
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
@@ -565,6 +560,18 @@ async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
     store_random_values(&nodes, 100).await.ok();
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
+    iroh_perfect_routing_tables(500).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "runs very long and takes a lot of mem"]
+async fn iroh_perfect_routing_tables_10k() -> TestResult<()> {
+    iroh_perfect_routing_tables(10000).await
+}
+
 
 #[tokio::test(flavor = "multi_thread")]
 async fn random_lookup_strategy() {
