@@ -197,8 +197,8 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     let mut common_count = vec![0usize; n];
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
-        if nodes.len() > 10000 {
-            println!("{i}");
+        if nodes.len() > 1 {
+            println!("Value {i}");
         }
         let text = format!("Item {i}");
         let expected_ids = expected_ids(&ids, Id::blake3_hash(text.as_bytes()), 20);
@@ -483,7 +483,11 @@ async fn iroh_create_nodes(
                     .await?;
                 let addr = endpoint.node_addr().initialized().await;
                 discovery.add_node_info(addr.clone());
-                let pool = ConnectionPool::new(endpoint.clone(), DHT_TEST_ALPN, Default::default());
+                let pool = ConnectionPool::new(endpoint.clone(), DHT_TEST_ALPN, iroh_connection_pool::connection_pool::Options {
+                    max_connections: 500,
+                    idle_timeout: Duration::from_secs(1),
+                    connect_timeout: Duration::from_secs(1),
+                });
                 let pool = IrohPool::new(endpoint.clone(), pool);
                 let bootstrap = (0..n_bootstrap)
                     .map(|i| node_ids[(offfset + i + 1) % n])

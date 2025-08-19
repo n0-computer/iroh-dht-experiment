@@ -543,7 +543,7 @@ pub mod api {
     }
 }
 pub use api::ApiClient;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 mod routing {
     use std::{
@@ -1652,7 +1652,7 @@ impl<P: ClientPool> State<P> {
         } else {
             Some(self.pool.id())
         };
-        println!("Querying node {} for target {}", id, target);
+        info!(%id, %target, "Querying node");
         let t0 = Instant::now();
         let client = self
             .pool
@@ -1660,7 +1660,7 @@ impl<P: ClientPool> State<P> {
             .await
             .map_err(|_| "Failed to get client");
         if let Err(e) = &client {
-            println!("Failed to get client: {e}");
+            info!(%id, "Failed to get client: {e}");
             return Err("Failed to get client");
         }
         let client = client?;
@@ -1669,12 +1669,12 @@ impl<P: ClientPool> State<P> {
             .await
             .map_err(|_| "Failed to query node");
         if let Err(e) = &infos {
-            println!("Failed to query node: {e}");
+            info!(%id, "Failed to query node: {e}");
             return Err("Failed to query node");
         }
         let infos = infos?;
         drop(client);
-        println!("Done with client after {:?}", t0.elapsed());
+        info!(%id, "Done with client after {:?}", t0.elapsed());
         let ids = infos.iter().map(|info| info.node_id).collect();
         for info in infos {
             self.pool.add_node_addr(info);
