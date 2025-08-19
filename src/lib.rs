@@ -69,7 +69,7 @@
 //! [irpc blog post]: https://www.iroh.computer/blog/irpc/
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use futures_buffered::FuturesUnordered;
@@ -848,6 +848,7 @@ mod u256 {
         }
 
         /// Get the number of leading zeros
+        #[allow(dead_code)]
         pub fn leading_zeros(&self) -> u32 {
             let mut count = 0;
             for &byte in self.0.iter().rev() {
@@ -1651,16 +1652,29 @@ impl<P: ClientPool> State<P> {
         } else {
             Some(self.pool.id())
         };
+        println!("Querying node {} for target {}", id, target);
+        let t0 = Instant::now();
         let client = self
             .pool
             .client(id)
             .await
-            .map_err(|_| "Failed to get client")?;
+            .map_err(|_| "Failed to get client");
+        if let Err(e) = &client {
+            println!("Failed to get client: {e}");
+            return Err("Failed to get client");
+        }
+        let client = client?;
         let infos = client
             .find_node(target, requester)
             .await
-            .map_err(|_| "Failed to query node")?;
+            .map_err(|_| "Failed to query node");
+        if let Err(e) = &infos {
+            println!("Failed to query node: {e}");
+            return Err("Failed to query node");
+        }
+        let infos = infos?;
         drop(client);
+        println!("Done with client after {:?}", t0.elapsed());
         let ids = infos.iter().map(|info| info.node_id).collect();
         for info in infos {
             self.pool.add_node_addr(info);
