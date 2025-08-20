@@ -572,7 +572,6 @@ async fn iroh_perfect_routing_tables_10k() -> TestResult<()> {
     iroh_perfect_routing_tables(10000).await
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn random_lookup_strategy() {
     let n = 1000;
