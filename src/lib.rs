@@ -721,7 +721,7 @@ mod routing {
     #[derive(Debug)]
     pub(crate) struct RoutingTable {
         pub buckets: Box<Buckets>,
-        local_id: NodeId,
+        pub local_id: NodeId,
     }
 
     #[derive(Debug, Clone)]
@@ -838,9 +838,14 @@ use crate::{
 };
 
 struct Node {
-    id: NodeId,
     routing_table: RoutingTable,
     storage: MemStorage,
+}
+
+impl Node {
+    fn id(&self) -> &NodeId {
+        &self.routing_table.local_id
+    }
 }
 
 struct MemStorage {
@@ -1531,7 +1536,7 @@ where
                 let blended = false;
                 let id = if blended {
                     let bucket = self.rng.gen_range::<u32, _>(0..BUCKET_COUNT as u32 + 2);
-                    let this = U256::from_le_bytes(*self.node.id.as_bytes());
+                    let this = U256::from_le_bytes(*self.node.id().as_bytes());
                     let random = U256::from_le_bytes(self.rng.r#gen());
                     let res = blend(this, random, bucket);
                     Id::from(res.to_le_bytes())
@@ -1599,12 +1604,12 @@ where
                     .node
                     .routing_table
                     .find_closest_nodes(&msg.key, self.state.config.k);
-                let self_dist = Distance::between(&self.node.id.as_bytes(), &msg.key);
+                let self_dist = Distance::between(&self.node.id().as_bytes(), &msg.key);
                 // if we know k nodes that are closer to the key than we are, we don't want to store
                 // the data!
                 if ids.len() >= self.state.config.k
                     && ids.iter().all(|id| {
-                        Distance::between(&self.node.id.as_bytes(), id.as_bytes()) < self_dist
+                        Distance::between(&self.node.id().as_bytes(), id.as_bytes()) < self_dist
                     })
                 {
                     msg.tx.send(SetResponse::ErrDistance).await.ok();
@@ -1909,7 +1914,6 @@ fn create_node_impl<P: ClientPool>(
     config: Config,
 ) -> (RpcClient, ApiClient) {
     let mut node = Node {
-        id,
         routing_table: RoutingTable::new(id, buckets),
         storage: MemStorage::new(),
     };

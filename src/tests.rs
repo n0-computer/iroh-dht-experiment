@@ -603,8 +603,8 @@ async fn self_lookup_strategy() {
     });
     let nodes = create_nodes(&ids, bootstrap, config).await;
     for _i in 0..20 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
         plot_random_lookup_stats(&nodes, 100).await.ok();
+        tokio::time::sleep(Duration::from_secs(1)).await;
         println!();
     }
 }
