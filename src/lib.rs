@@ -680,7 +680,7 @@ mod routing {
     }
 
     #[derive(Debug, Clone, Default)]
-    pub(crate) struct KBucket {
+    pub struct KBucket {
         nodes: ArrayVec<NodeInfo, K>,
     }
 
@@ -691,7 +691,7 @@ mod routing {
             }
         }
 
-        fn add_node(&mut self, node: NodeInfo) -> bool {
+        pub fn add_node(&mut self, node: NodeInfo) -> bool {
             // Check if node already exists and update it
             for existing in &mut self.nodes {
                 if existing.id == node.id {
@@ -719,13 +719,13 @@ mod routing {
     }
 
     #[derive(Debug)]
-    pub(crate) struct RoutingTable {
+    pub struct RoutingTable {
         pub buckets: Box<Buckets>,
         pub local_id: NodeId,
     }
 
     #[derive(Debug, Clone)]
-    pub(crate) struct Buckets([KBucket; BUCKET_COUNT]);
+    pub struct Buckets(pub [KBucket; BUCKET_COUNT]);
 
     impl Buckets {
         pub fn iter(&self) -> std::slice::Iter<'_, KBucket> {
@@ -801,7 +801,7 @@ mod routing {
             self.buckets.iter().flat_map(|bucket| bucket.nodes())
         }
 
-        pub(crate) fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<NodeId> {
+        pub fn find_closest_nodes(&self, target: &Id, k: usize) -> Vec<NodeId> {
             // this does a brute force scan, but even so it should be very fast.
             // xor is basically free, and comparing distances as well.
             // so the most expensive thing is probably the memory allocation.
@@ -827,6 +827,14 @@ mod routing {
                 .collect()
         }
     }
+}
+
+#[doc(hidden)]
+pub mod bench_exports {
+    pub use crate::{
+        routing::{Buckets, KBucket, NodeInfo, RoutingTable},
+        rpc::Id,
+    };
 }
 
 use crate::{
