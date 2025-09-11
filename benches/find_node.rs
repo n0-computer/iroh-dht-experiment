@@ -48,8 +48,9 @@ fn bench_fib(c: &mut Criterion) {
     let key = random_key(&mut rng);
 
     // Benchmark the function for different inputs
-    for n in [1].iter().cloned() {
-        group.bench_function(&format!("iter_{}", n), |b| {
+    {
+        let n = &1;
+        group.bench_function(format!("iter_{n}"), |b| {
             b.iter(|| rt.find_closest_nodes(std::hint::black_box(&key), std::hint::black_box(20)));
         });
     }

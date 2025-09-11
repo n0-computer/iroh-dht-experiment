@@ -30,7 +30,7 @@ impl ClientPool for TestPool {
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or_else(|| format!("client not found: {}", id))?;
+            .ok_or_else(|| format!("client not found: {id}"))?;
         Ok(client)
     }
 
@@ -43,7 +43,7 @@ fn expected_ids(ids: &[NodeId], key: Id, n: usize) -> Vec<NodeId> {
     let mut expected = ids
         .iter()
         .cloned()
-        .map(|id| (Distance::between(&id.as_bytes(), &key), id))
+        .map(|id| (Distance::between(id.as_bytes(), &key), id))
         .collect::<Vec<_>>();
     // distances are unique!
     expected.sort_unstable();
@@ -545,7 +545,7 @@ async fn iroh_perfect_routing_tables(n: usize) -> TestResult<()> {
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
-    println!("Creating {} nodes", n);
+    println!("Creating {n} nodes");
     let iroh_nodes = iroh_create_nodes(&secrets, bootstrap, None).await?;
     let nodes = iroh_nodes
         .iter()
@@ -554,7 +554,7 @@ async fn iroh_perfect_routing_tables(n: usize) -> TestResult<()> {
     let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     println!("Initializing routing tables");
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-    println!("Spawning {} routers", n);
+    println!("Spawning {n} routers");
     let _routers = spawn_routers(&iroh_nodes);
     println!("Storing random values");
     store_random_values(&nodes, 100).await.ok();
@@ -650,21 +650,21 @@ impl Frames {
     }
 
     fn height(&self) -> Option<usize> {
-        let first = self.data.get(0)?;
+        let first = self.data.first()?;
         assert!(
             self.data.iter().all(|f| f.len() == first.len()),
             "All frames must have the same length"
         );
         assert!(self.stride > 0, "Stride must be greater than zero");
         assert!(
-            first.len() % self.stride == 0,
+            first.len().is_multiple_of(self.stride),
             "Size must be a multiple of stride"
         );
         Some(first.len() / self.stride)
     }
 
     fn side_by_side(frames: &[&Frames], gap: usize) -> TestResult<Frames> {
-        let first = frames.get(0).unwrap();
+        let first = frames.first().unwrap();
         let height = first.height().unwrap();
         let n_frames = first.data.len();
         assert!(
@@ -694,7 +694,7 @@ impl Frames {
                     let line = iter.next().unwrap();
                     if i > 0 {
                         // add gap between frames
-                        frame.extend(std::iter::repeat(false).take(gap));
+                        frame.extend(std::iter::repeat_n(false, gap));
                     }
                     frame.extend_from_slice(line);
                 }
@@ -711,7 +711,7 @@ impl Frames {
         let size = self.data[0].len();
         assert!(self.stride > 0, "Stride must be greater than zero");
         assert!(
-            size % self.stride == 0,
+            size.is_multiple_of(self.stride),
             "Height must be a multiple of stride"
         );
         assert!(
@@ -751,7 +751,7 @@ impl Frames {
 
 async fn make_frame(ids: &[NodeId], nodes: &Nodes) -> TestResult<Vec<bool>> {
     let mut res = Vec::new();
-    for (_, (_, (_, api))) in nodes.iter().enumerate() {
+    for (_, (_, api)) in nodes.iter() {
         let routing_table = api.get_routing_table().await?;
         let node_ids = routing_table
             .iter()
@@ -811,7 +811,7 @@ async fn partition_1k() -> TestResult<()> {
         plot_random_lookup_stats(&nodes, 100).await.ok();
         let last_id = nodes.last().unwrap().0;
         let mut knows_last_id = 0;
-        for (_, (_, (_, api))) in nodes.iter().enumerate() {
+        for (_, (_, api)) in nodes.iter() {
             let routing_table = api.get_routing_table().await?;
             knows_last_id += routing_table
                 .iter()

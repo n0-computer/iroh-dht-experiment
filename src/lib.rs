@@ -766,7 +766,7 @@ mod routing {
         }
 
         fn bucket_index(&self, target: &[u8; 32]) -> usize {
-            let distance = xor(&self.local_id.as_bytes(), target);
+            let distance = xor(self.local_id.as_bytes(), target);
             let zeros = leading_zeros(&distance);
             if zeros >= BUCKET_COUNT {
                 0 // Same node case
@@ -1201,7 +1201,7 @@ pub mod pool {
                 .inner
                 .connect(node_id)
                 .await
-                .map_err(|e| format!("Failed to connect: {}", e));
+                .map_err(|e| format!("Failed to connect: {e}"));
             let connection = connection?;
             let client = RpcClient::new(irpc::Client::boxed(IrohConnection(Arc::new(connection))));
             Ok(client)
@@ -1612,12 +1612,12 @@ where
                     .node
                     .routing_table
                     .find_closest_nodes(&msg.key, self.state.config.k);
-                let self_dist = Distance::between(&self.node.id().as_bytes(), &msg.key);
+                let self_dist = Distance::between(self.node.id().as_bytes(), &msg.key);
                 // if we know k nodes that are closer to the key than we are, we don't want to store
                 // the data!
                 if ids.len() >= self.state.config.k
                     && ids.iter().all(|id| {
-                        Distance::between(&self.node.id().as_bytes(), id.as_bytes()) < self_dist
+                        Distance::between(self.node.id().as_bytes(), id.as_bytes()) < self_dist
                     })
                 {
                     msg.tx.send(SetResponse::ErrDistance).await.ok();
@@ -1786,14 +1786,14 @@ impl<P: ClientPool> State<P> {
         let mut candidates = initial
             .into_iter()
             .filter(|addr| *addr != self.pool.id())
-            .map(|id| (Distance::between(&target, &id.as_bytes()), id))
+            .map(|id| (Distance::between(&target, id.as_bytes()), id))
             .collect::<BTreeSet<_>>();
         let mut queried = HashSet::new();
         let mut tasks = FuturesUnordered::new();
         let mut result = BTreeSet::new();
         queried.insert(self.pool.id());
         result.insert((
-            Distance::between(&self.pool.id().as_bytes(), &target),
+            Distance::between(self.pool.id().as_bytes(), &target),
             self.pool.id(),
         ));
 
@@ -1813,7 +1813,7 @@ impl<P: ClientPool> State<P> {
                     continue;
                 };
                 for cand in cands {
-                    let dist = Distance::between(&target, &cand.as_bytes());
+                    let dist = Distance::between(&target, cand.as_bytes());
                     if !queried.contains(&cand) {
                         candidates.insert((dist, cand));
                     }
