@@ -33,24 +33,45 @@ fn create_full_rt(rng: &mut impl Rng) -> dht2::bench_exports::RoutingTable {
         }
     }
 
-    assert_eq!(
-        rt.buckets.iter().map(|x| x.nodes().len()).sum::<usize>(),
-        256 * 20
-    );
+    assert_eq!(rt.nodes().count(), 256 * 20);
     rt
 }
 
-fn bench_fib(c: &mut Criterion) {
-    let mut group = c.benchmark_group("find_closest_nodes"); // Groups related benchmarks for reporting
+/// Create a more realistic routing table with 256 buckets, where you just give it n nodes
+/// to remember (it won't remember all of them since buckets will fill up!).
+fn create_realistic_rt(rng: &mut impl Rng, n: usize) -> dht2::bench_exports::RoutingTable {
+    let local_id = random_node_id(rng);
+    let mut rt = RoutingTable {
+        buckets: Default::default(),
+        local_id,
+    };
+    for i in 0..n {
+        rt.add_node(NodeInfo {
+            id: random_node_id(rng),
+            last_seen: i as u64,
+        });
+    }
+    rt
+}
+
+fn bench_rt(c: &mut Criterion) {
+    let mut group = c.benchmark_group("RoutingTable::find_closest_nodes"); // Groups related benchmarks for reporting
 
     let mut rng = rand::thread_rng();
-    let rt = create_full_rt(&mut rng);
+    let full_rt = create_full_rt(&mut rng);
     let key = random_key(&mut rng);
 
-    // Benchmark the function for different inputs
-    {
-        let n = &1;
-        group.bench_function(format!("iter_{n}"), |b| {
+    // Benchmark for a routing table where every single k-bucket is full. This is the worst case, but will only happen with absolutely
+    // gigantic networks.
+    group.bench_function(format!("full"), |b| {
+        b.iter(|| full_rt.find_closest_nodes(std::hint::black_box(&key), std::hint::black_box(20)));
+    });
+
+    // Benchmark for more realistic routing tables with varying sizes. The buckets near the local node will rarely be full.
+    for n in [10000, 100000, 1000000] {
+        let rt = create_realistic_rt(&mut rng, n);
+        let size = rt.nodes().count();
+        group.bench_function(format!("realistic {n}/{size}"), |b| {
             b.iter(|| rt.find_closest_nodes(std::hint::black_box(&key), std::hint::black_box(20)));
         });
     }
@@ -58,5 +79,5 @@ fn bench_fib(c: &mut Criterion) {
     group.finish(); // End the group
 }
 
-criterion_group!(benches, bench_fib); // Register the benchmark group
+criterion_group!(benches, bench_rt); // Register the benchmark group
 criterion_main!(benches); // The main harness function

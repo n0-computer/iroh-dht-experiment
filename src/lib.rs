@@ -783,7 +783,7 @@ mod routing {
                 .any(|node| node.id == *id)
         }
 
-        pub(crate) fn add_node(&mut self, node: NodeInfo) -> bool {
+        pub fn add_node(&mut self, node: NodeInfo) -> bool {
             if node.id == self.local_id {
                 return false;
             }
@@ -797,7 +797,7 @@ mod routing {
             self.buckets[bucket_idx].remove_node(id);
         }
 
-        pub(crate) fn nodes(&self) -> impl Iterator<Item = &NodeInfo> {
+        pub fn nodes(&self) -> impl Iterator<Item = &NodeInfo> {
             self.buckets.iter().flat_map(|bucket| bucket.nodes())
         }
 
