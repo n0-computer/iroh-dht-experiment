@@ -2,7 +2,10 @@
 //!
 //! These are long running tests that spawn a lot of nodes and observe the
 //! behaviour of an entire swarm. Most tests use in-memory nodes.
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use iroh::{
     Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider, endpoint::BindError,
@@ -156,7 +159,7 @@ fn make_histogram(data: &[usize]) -> Vec<usize> {
     histogram
 }
 
-fn plot(title: &str, data: &[usize]) {
+fn plot_console(title: &str, data: &[usize]) {
     let data: Vec<(f32, f32)> = data
         .iter()
         .enumerate()
@@ -167,6 +170,52 @@ fn plot(title: &str, data: &[usize]) {
     Chart::new(100, 40, 0.0, (data.len() - 1) as f32)
         .lineplot(&Shape::Bars(&data))
         .nice();
+}
+
+fn plot_png(title: &str, data: &[usize]) {
+    use plotters::prelude::*;
+    let data: Vec<(f32, f32)> = data
+        .iter()
+        .enumerate()
+        .map(|(items_stored, num_nodes)| (items_stored as f32, *num_nodes as f32))
+        .collect();
+    // PNG plot
+    let filename = format!("{}.png", title.replace(' ', "_")).to_lowercase();
+    let path = PathBuf::from("img/").join(&filename);
+    std::fs::create_dir_all("img/").unwrap();
+    let root = BitMapBackend::new(&path, (1024, 768)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+
+    let max_y = data.iter().map(|&(_, y)| y).fold(0f32, f32::max);
+    let mut chart = ChartBuilder::on(&root)
+        .caption(title, ("sans-serif", 30).into_font())
+        .margin(10)
+        .x_label_area_size(30)
+        .y_label_area_size(30)
+        .build_cartesian_2d(0f32..(data.len() as f32), 0f32..max_y * 1.1)
+        .unwrap();
+
+    chart
+        .configure_mesh()
+        .x_labels(5)
+        .y_labels(5)
+        .draw()
+        .unwrap();
+
+    // Draw bars for a bar chart effect
+    chart
+        .draw_series(data.iter().zip(0..).map(|((x, y), _)| {
+            let bar = Rectangle::new([(*x, 0f32), (*x + 1.0, *y)], BLUE.filled());
+            bar
+        }))
+        .unwrap();
+
+    root.present().unwrap();
+}
+
+fn plot(title: &str, data: &[usize]) {
+    plot_console(title, data);
+    plot_png(title, data);
 }
 
 /// Let each node do a random lookup
@@ -191,7 +240,7 @@ async fn random_lookup_n(nodes: &Nodes, n: usize, seed: u64) -> irpc::Result<()>
     Ok(())
 }
 
-async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
+async fn store_random_values(prefix: &str, nodes: &Nodes, n: usize) -> irpc::Result<()> {
     let (_, (_, api)) = nodes[nodes.len() / 2].clone();
     let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let mut common_count = vec![0usize; n];
@@ -236,24 +285,30 @@ async fn store_random_values(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     }
 
     plot(
-        "Histogram - Commonality with perfect set of 20 ids",
+        &format!("{prefix} - Histogram - Commonality with perfect set of 20 ids"),
         &make_histogram(&common_count),
     );
-    plot("Storage usage per node", &storage_count);
     plot(
-        "Histogram - Storage usage per node",
+        &format!("{prefix} - Storage usage per node"),
+        &storage_count,
+    );
+    plot(
+        &format!("{prefix} - Histogram - Storage usage per node"),
         &make_histogram(&storage_count),
     );
-    plot("Routing table size per node", &routing_table_size);
     plot(
-        "Histogram - Routing table size per node",
+        &format!("{prefix} - Routing table size per node"),
+        &routing_table_size,
+    );
+    plot(
+        &format!("{prefix} - Histogram - Routing table size per node"),
         &make_histogram(&routing_table_size),
     );
     Ok(())
 }
 
 /// Performs n random lookups without storing anything, then plots stats
-async fn plot_random_lookup_stats(nodes: &Nodes, n: usize) -> irpc::Result<()> {
+async fn plot_random_lookup_stats(prefix: &str, nodes: &Nodes, n: usize) -> irpc::Result<()> {
     let (_, (_, api)) = nodes[nodes.len() / 2].clone();
     let ids = nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let mut common_count = vec![0usize; n];
@@ -285,17 +340,23 @@ async fn plot_random_lookup_stats(nodes: &Nodes, n: usize) -> irpc::Result<()> {
     }
 
     plot(
-        "Histogram - Commonality with perfect set of 20 ids",
+        &format!("{prefix} - Histogram - Commonality with perfect set of 20 ids"),
         &make_histogram(&common_count),
     );
-    plot("Storage usage per node", &storage_count);
     plot(
-        "Histogram - Storage usage per node",
+        &format!("{prefix} - Storage usage per node"),
+        &storage_count,
+    );
+    plot(
+        &format!("{prefix} - Histogram - Storage usage per node"),
         &make_histogram(&storage_count),
     );
-    plot("Routing table size per node", &routing_table_size);
     plot(
-        "Histogram - Routing table size per node",
+        &format!("{prefix} - Routing table size per node"),
+        &routing_table_size,
+    );
+    plot(
+        &format!("{prefix} - Histogram - Routing table size per node"),
         &make_histogram(&routing_table_size),
     );
     Ok(())
@@ -324,6 +385,7 @@ fn next_n(n: usize) -> impl Fn(usize) -> Vec<usize> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_routing_1k() {
+    let prefix = "no_routing_1k";
     let n = 1000;
     let seed = 0;
     let bootstrap = next_n(0);
@@ -360,9 +422,12 @@ async fn no_routing_1k() {
             storage_count[index] = n;
         }
     }
-    plot("Storage usage per node", &storage_count);
     plot(
-        "Histogram - Storage usage per node",
+        &format!("{prefix} - Storage usage per node"),
+        &storage_count,
+    );
+    plot(
+        &format!("{prefix} -Histogram - Storage usage per node"),
         &make_histogram(&storage_count),
     );
 }
@@ -376,7 +441,9 @@ async fn perfect_routing_tables_1k() {
     let ids = create_node_ids(&secrets);
     let nodes = create_nodes(&ids, bootstrap, Config::default()).await;
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values("perfect_routing_tables_1k", &nodes, 100)
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -392,7 +459,9 @@ async fn perfect_routing_tables_10k() {
     println!("init routing tables");
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
     println!("store random values");
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values("perfect_routing_tables_10k", &nodes, 100)
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -409,7 +478,9 @@ async fn perfect_routing_tables_100k() {
     init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
 
     println!("store random values");
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values("perfect_routing_tables_100k", &nodes, 100)
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -423,10 +494,12 @@ async fn just_bootstrap_1k() {
 
     // tell all nodes about all ids, shuffled for each node
     // init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values("just_bootstrap_1k", &nodes, 100)
+        .await
+        .ok();
 }
 
-async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
+async fn random_lookup_test(prefix: &str, n: usize, seed: u64, lookups: usize) {
     // bootstrap must be set so the random lookups have a chance to work!
     let bootstrap = next_n(20);
     let secrets = create_secrets(seed, n);
@@ -437,13 +510,13 @@ async fn random_lookup_test(n: usize, seed: u64, lookups: usize) {
 
     // tell all nodes about all ids, shuffled for each node
     // init_routing_tables(&nodes, &ids, Some(seed)).await.ok();
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values(prefix, &nodes, 100).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn random_lookup_1k() {
     for lookups in 0..10 {
-        random_lookup_test(1000, 0, lookups).await;
+        random_lookup_test(&format!("random_lookup_1k_{}", lookups), 1000, 0, lookups).await;
     }
 }
 
@@ -541,7 +614,7 @@ fn spawn_routers(iroh_nodes: &IrohNodes) -> Vec<Router> {
         })
         .collect()
 }
-async fn iroh_perfect_routing_tables(n: usize) -> TestResult<()> {
+async fn iroh_perfect_routing_tables(prefix: &str, n: usize) -> TestResult<()> {
     let seed = 0;
     let bootstrap = 0;
     let secrets = create_secrets(seed, n);
@@ -557,19 +630,19 @@ async fn iroh_perfect_routing_tables(n: usize) -> TestResult<()> {
     println!("Spawning {n} routers");
     let _routers = spawn_routers(&iroh_nodes);
     println!("Storing random values");
-    store_random_values(&nodes, 100).await.ok();
+    store_random_values(prefix, &nodes, 100).await.ok();
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn iroh_perfect_routing_tables_500() -> TestResult<()> {
-    iroh_perfect_routing_tables(500).await
+    iroh_perfect_routing_tables("perfect_routing_tables_500", 500).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "runs very long and takes a lot of mem"]
 async fn iroh_perfect_routing_tables_10k() -> TestResult<()> {
-    iroh_perfect_routing_tables(10000).await
+    iroh_perfect_routing_tables("perfect_routing_tables_10k", 10000).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -586,7 +659,9 @@ async fn random_lookup_strategy() {
     let nodes = create_nodes(&ids, bootstrap, config).await;
     for _i in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+        plot_random_lookup_stats("random_lookup_strategy", &nodes, 100)
+            .await
+            .ok();
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -602,8 +677,10 @@ async fn self_lookup_strategy() {
         interval: Duration::from_secs(1),
     });
     let nodes = create_nodes(&ids, bootstrap, config).await;
-    for _i in 0..20 {
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+    for i in 0..20 {
+        plot_random_lookup_stats(&format!("self_lookup_strategy-{}", i), &nodes, 100)
+            .await
+            .ok();
         tokio::time::sleep(Duration::from_secs(1)).await;
         println!();
     }
@@ -627,7 +704,9 @@ async fn self_and_random_lookup_strategy() {
     let nodes = create_nodes(&ids, bootstrap, config).await;
     for _i in 0..20 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+        plot_random_lookup_stats("self_and_random_lookup_strategy", &nodes, 100)
+            .await
+            .ok();
         println!();
     }
 }
@@ -718,6 +797,9 @@ impl Frames {
             self.data.iter().all(|f| f.len() == size),
             "All frames must have the same length"
         );
+        if let Some(parent) = target.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
         let width = self.stride;
         let height = size / self.stride;
@@ -793,9 +875,11 @@ async fn partition_1k() -> TestResult<()> {
         });
     let (nodes, _clients) = create_nodes_and_clients(&ids, bootstrap, config).await;
     let mut frames = Vec::new();
-    for _i in 0..10 {
+    for i in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+        plot_random_lookup_stats(&format!("partition_1k-{i}-"), &nodes, 100)
+            .await
+            .ok();
         frames.push(make_frame(&ids, &nodes).await?);
         println!();
     }
@@ -806,9 +890,11 @@ async fn partition_1k() -> TestResult<()> {
         api.nodes_seen(&[id0]).await.ok();
     }
     let mut frames = Frames::new(n);
-    for _i in 0..30 {
+    for i in 0..30 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        plot_random_lookup_stats(&nodes, 100).await.ok();
+        plot_random_lookup_stats(&format!("partition_1k-{}-", i + 10), &nodes, 100)
+            .await
+            .ok();
         let last_id = nodes.last().unwrap().0;
         let mut knows_last_id = 0;
         for (_, (_, api)) in nodes.iter() {
@@ -821,7 +907,7 @@ async fn partition_1k() -> TestResult<()> {
         frames.data.push(make_frame(&ids, &nodes).await?);
         println!("Nodes that know about last_id: {knows_last_id}");
     }
-    frames.make_gif(100, "partition_1k.gif")?;
+    frames.make_gif(100, "img/partition_1k.gif")?;
     Ok(())
 }
 
@@ -863,7 +949,7 @@ async fn remove_1k() -> TestResult<()> {
         frames.data.push(make_frame(&ids, &nodes).await?);
         println!();
     }
-    frames.make_gif(100, "remove_1k.gif")?;
+    frames.make_gif(100, "img/remove_1k.gif")?;
     Ok(())
 }
 
@@ -950,6 +1036,6 @@ async fn random_vs_blended_1k() -> TestResult<()> {
         frames
     };
     let frames = Frames::side_by_side(&[&random, &blended, &perfect], 20)?;
-    frames.make_gif(100, "random_vs_blended_1k.gif")?;
+    frames.make_gif(100, "img/random_vs_blended_1k.gif")?;
     Ok(())
 }
