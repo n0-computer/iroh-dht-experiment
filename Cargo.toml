@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 keywords = ["dht", "content-discovery", "blake3"]
+description = "Experimental DHT for iroh"
+tags = ["iroh", "dht", "p2p"]
 
 [dependencies]
 arrayvec = "0.7.6"
