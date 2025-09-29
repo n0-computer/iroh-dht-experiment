@@ -1116,6 +1116,7 @@ pub mod pool {
         pub message: String,
     }
 
+    /// A client pool backed by real iroh connections.
     #[derive(Debug, Clone)]
     pub struct IrohPool {
         endpoint: Endpoint,
@@ -1299,64 +1300,70 @@ pub struct Config {
     lookup_strategies: LookupStrategies,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LookupStrategies {
-    /// Random lookup strategy.
-    random: Option<RandomLookupStrategy>,
-    /// Self lookup strategy.
-    self_id: Option<SelfLookupStrategy>,
-    /// Candidate lookup strategy.
-    candidate: Option<CandidateLookupStrategy>,
-}
+pub mod config {
+    //! Detailed configuration for the DHT.
+    use super::*;
 
-impl LookupStrategies {
-    /// No lookup strategies.
-    ///
-    /// This is good for testing, since it allows you to trigger lookups
-    /// manually. But don't use this in prod!
-    pub fn none() -> Self {
-        Self {
-            random: None,
-            self_id: None,
-            candidate: None,
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct LookupStrategies {
+        /// Random lookup strategy.
+        pub random: Option<RandomLookupStrategy>,
+        /// Self lookup strategy.
+        pub self_id: Option<SelfLookupStrategy>,
+        /// Candidate lookup strategy.
+        pub candidate: Option<CandidateLookupStrategy>,
+    }
+
+    impl LookupStrategies {
+        /// No lookup strategies.
+        ///
+        /// This is good for testing, since it allows you to trigger lookups
+        /// manually. But don't use this in prod!
+        pub fn none() -> Self {
+            Self {
+                random: None,
+                self_id: None,
+                candidate: None,
+            }
         }
     }
-}
 
-/// This is the mechanism for adding new nodes to a DHT.
-///
-/// When we find a node that is not in our routing table, we don't immediately
-/// update our routing table. It could be a node that claims to be permanent
-/// but is transient. Instead, we add it to a list of candidates for inclusion
-/// that gets used periodically.
-///
-/// We perform random lookups with the candidate nodes as initial peers. This
-/// will cause them to be validated by sending them a FindNode query, and as
-/// a side effect of validating we update our routing table.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CandidateLookupStrategy {
-    max_lookups: usize,
-    interval: Duration,
-}
+    /// This is the mechanism for adding new nodes to a DHT.
+    ///
+    /// When we find a node that is not in our routing table, we don't immediately
+    /// update our routing table. It could be a node that claims to be permanent
+    /// but is transient. Instead, we add it to a list of candidates for inclusion
+    /// that gets used periodically.
+    ///
+    /// We perform random lookups with the candidate nodes as initial peers. This
+    /// will cause them to be validated by sending them a FindNode query, and as
+    /// a side effect of validating we update our routing table.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct CandidateLookupStrategy {
+        pub max_lookups: usize,
+        pub interval: Duration,
+    }
 
-/// Perform a periodic self-lookup.
-///
-/// This is useful to update the buckets close to self. Random lookups will
-/// rarely hit these.
+    /// Perform a periodic self-lookup.
+    ///
+    /// This is useful to update the buckets close to self. Random lookups will
+    /// rarely hit these.
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SelfLookupStrategy {
-    interval: Duration,
-}
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct SelfLookupStrategy {
+        pub interval: Duration,
+    }
 
-/// Perform a periodic random lookup.
-///
-/// This is useful to update the buckets that are far away from self.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RandomLookupStrategy {
-    interval: Duration,
-    blended: bool,
+    /// Perform a periodic random lookup.
+    ///
+    /// This is useful to update the buckets that are far away from self.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct RandomLookupStrategy {
+        pub interval: Duration,
+        pub blended: bool,
+    }
 }
+use config::*;
 
 impl Config {
     /// Configuration for a transient node that does not want to be included
