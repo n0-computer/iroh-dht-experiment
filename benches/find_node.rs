@@ -63,7 +63,7 @@ fn bench_rt(c: &mut Criterion) {
 
     // Benchmark for a routing table where every single k-bucket is full. This is the worst case, but will only happen with absolutely
     // gigantic networks.
-    group.bench_function(format!("full"), |b| {
+    group.bench_function("full".to_string(), |b| {
         b.iter(|| full_rt.find_closest_nodes(std::hint::black_box(&key), std::hint::black_box(20)));
     });
 

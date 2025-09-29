@@ -205,8 +205,8 @@ fn plot_png(title: &str, data: &[usize]) {
     // Draw bars for a bar chart effect
     chart
         .draw_series(data.iter().zip(0..).map(|((x, y), _)| {
-            let bar = Rectangle::new([(*x, 0f32), (*x + 1.0, *y)], BLUE.filled());
-            bar
+            
+            Rectangle::new([(*x, 0f32), (*x + 1.0, *y)], BLUE.filled())
         }))
         .unwrap();
 
@@ -516,7 +516,7 @@ async fn random_lookup_test(prefix: &str, n: usize, seed: u64, lookups: usize) {
 #[tokio::test(flavor = "multi_thread")]
 async fn random_lookup_1k() {
     for lookups in 0..10 {
-        random_lookup_test(&format!("random_lookup_1k_{}", lookups), 1000, 0, lookups).await;
+        random_lookup_test(&format!("random_lookup_1k_{lookups}"), 1000, 0, lookups).await;
     }
 }
 
@@ -679,7 +679,7 @@ async fn self_lookup_strategy() {
     });
     let nodes = create_nodes(&ids, bootstrap, config).await;
     for i in 0..20 {
-        plot_random_lookup_stats(&format!("self_lookup_strategy-{}", i), &nodes, 100)
+        plot_random_lookup_stats(&format!("self_lookup_strategy-{i}"), &nodes, 100)
             .await
             .ok();
         tokio::time::sleep(Duration::from_secs(1)).await;
