@@ -204,10 +204,11 @@ fn plot_png(title: &str, data: &[usize]) {
 
     // Draw bars for a bar chart effect
     chart
-        .draw_series(data.iter().zip(0..).map(|((x, y), _)| {
-            
-            Rectangle::new([(*x, 0f32), (*x + 1.0, *y)], BLUE.filled())
-        }))
+        .draw_series(
+            data.iter()
+                .zip(0..)
+                .map(|((x, y), _)| Rectangle::new([(*x, 0f32), (*x + 1.0, *y)], BLUE.filled())),
+        )
         .unwrap();
 
     root.present().unwrap();
@@ -886,8 +887,8 @@ async fn partition_1k() -> TestResult<()> {
     }
     let id0 = nodes[0].0;
     // tell the partitioned nodes about id0
-    for i in k..n {
-        let (_, (_, api)) = &nodes[i];
+    for node in &nodes[k..] {
+        let (_, (_, api)) = node;
         api.nodes_seen(&[id0]).await.ok();
     }
     let mut frames = Frames::new(n);
@@ -942,8 +943,8 @@ async fn remove_1k() -> TestResult<()> {
         frames.data.push(make_frame(&ids, &nodes).await?);
         println!();
     }
-    for i in k..n {
-        clients.lock().unwrap().remove(&ids[i]);
+    for id in &ids[k..] {
+        clients.lock().unwrap().remove(id);
     }
     for _i in 0..40 {
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -897,6 +897,7 @@ impl MemStorage {
 }
 
 mod u256 {
+    #![allow(clippy::needless_range_loop)]
     use std::ops::{BitAnd, BitOr, BitXor, Deref, Not, Shl, Shr};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,6 +924,7 @@ mod u256 {
         }
 
         /// Get the underlying byte array (little-endian)
+        #[allow(clippy::wrong_self_convention)]
         pub fn to_le_bytes(&self) -> [u8; 32] {
             self.0
         }
