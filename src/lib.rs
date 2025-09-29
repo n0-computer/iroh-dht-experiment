@@ -395,20 +395,25 @@ pub mod api {
     pub enum ApiProto {
         /// NodesSeen can only be called for node ids, but we don't bother
         /// to provide AddrInfo here since the routing table does not store it.
-        #[rpc(wrap, tx = NoSender)]
+        #[rpc(tx = NoSender)]
+        #[wrap(NodesSeen)]
         NodesSeen { ids: Vec<NodeId> },
         /// NodesDead can only be called for node ids, but we don't bother
         /// to provide AddrInfo here since the routing table does not store it.
-        #[rpc(wrap, tx = NoSender)]
+        #[rpc(tx = NoSender)]
+        #[wrap(NodesDead)]
         NodesDead { ids: Vec<NodeId> },
-        #[rpc(wrap, tx = oneshot::Sender<Vec<NodeId>>)]
+        #[rpc(tx = oneshot::Sender<Vec<NodeId>>)]
+        #[wrap(Lookup)]
         Lookup {
             initial: Option<Vec<NodeId>>,
             id: Id,
         },
-        #[rpc(wrap, tx = mpsc::Sender<NodeId>)]
+        #[rpc(tx = mpsc::Sender<NodeId>)]
+        #[wrap(NetworkPut)]
         NetworkPut { id: Id, value: Value },
-        #[rpc(wrap, tx = mpsc::Sender<(NodeId, Value)>)]
+        #[rpc(tx = mpsc::Sender<(NodeId, Value)>)]
+        #[wrap(NetworkGet)]
         NetworkGet {
             id: Id,
             kind: Kind,
@@ -416,19 +421,24 @@ pub mod api {
             n: Option<NonZeroU64>,
         },
         /// Get the routing table for testing
-        #[rpc(wrap, tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+        #[rpc(tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+        #[wrap(GetRoutingTable)]
         GetRoutingTable,
         /// Get storage stats for testing
-        #[rpc(wrap, tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
+        #[rpc(tx = oneshot::Sender<BTreeMap<Id, BTreeMap<Kind, usize>>>)]
+        #[wrap(GetStorageStats)]
         GetStorageStats,
         /// Perform a self lookup
-        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        #[rpc(tx = oneshot::Sender<()>)]
+        #[wrap(SelfLookup)]
         SelfLookup,
         /// Perform a random lookup
-        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        #[rpc(tx = oneshot::Sender<()>)]
+        #[wrap(RandomLookup)]
         RandomLookup,
         /// Perform a candidate lookup
-        #[rpc(wrap, tx = oneshot::Sender<()>)]
+        #[rpc(tx = oneshot::Sender<()>)]
+        #[wrap(CandidateLookup)]
         CandidateLookup,
     }
 
@@ -1064,7 +1074,7 @@ pub mod pool {
         Endpoint, NodeAddr, NodeId,
         endpoint::{RecvStream, SendStream},
     };
-    use iroh_connection_pool::connection_pool::{ConnectionPool, ConnectionRef};
+    use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef};
     use snafu::Snafu;
     use tracing::error;
 
@@ -1199,7 +1209,7 @@ pub mod pool {
             }
             let connection = self
                 .inner
-                .connect(node_id)
+                .get_or_connect(node_id)
                 .await
                 .map_err(|e| format!("Failed to connect: {e}"));
             let connection = connection?;

@@ -11,7 +11,7 @@ use iroh::{
     Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider, endpoint::BindError,
     protocol::Router,
 };
-use iroh_connection_pool::connection_pool::ConnectionPool;
+use iroh_blobs::util::connection_pool::ConnectionPool;
 use rand::{Rng, rngs::StdRng, seq::SliceRandom};
 use testresult::TestResult;
 use textplots::{Chart, Plot, Shape};
@@ -559,10 +559,11 @@ async fn iroh_create_nodes(
                 let pool = ConnectionPool::new(
                     endpoint.clone(),
                     DHT_TEST_ALPN,
-                    iroh_connection_pool::connection_pool::Options {
+                    iroh_blobs::util::connection_pool::Options {
                         max_connections: 32,
                         idle_timeout: Duration::from_secs(1),
                         connect_timeout: Duration::from_secs(1),
+                        on_connected: None,
                     },
                 );
                 let pool = IrohPool::new(endpoint.clone(), pool);

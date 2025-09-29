@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use dht2::bench_exports::{Id, NodeInfo, RoutingTable};
+use iroh_dht_experiment::bench_exports::{self, Id, NodeInfo, RoutingTable};
 use rand::Rng;
 
 fn random_node_id(rng: &mut impl Rng) -> iroh::PublicKey {
@@ -18,7 +18,7 @@ fn random_key(rng: &mut impl Rng) -> Id {
 ///
 /// This is not a correct routing table, since we don't take the level into account.
 /// But it will do for bechnarking find_node, since find_node does a full scan anyway.
-fn create_full_rt(rng: &mut impl Rng) -> dht2::bench_exports::RoutingTable {
+fn create_full_rt(rng: &mut impl Rng) -> bench_exports::RoutingTable {
     let local_id = random_node_id(rng);
     let mut rt = RoutingTable {
         buckets: Default::default(),
@@ -39,7 +39,7 @@ fn create_full_rt(rng: &mut impl Rng) -> dht2::bench_exports::RoutingTable {
 
 /// Create a more realistic routing table with 256 buckets, where you just give it n nodes
 /// to remember (it won't remember all of them since buckets will fill up!).
-fn create_realistic_rt(rng: &mut impl Rng, n: usize) -> dht2::bench_exports::RoutingTable {
+fn create_realistic_rt(rng: &mut impl Rng, n: usize) -> bench_exports::RoutingTable {
     let local_id = random_node_id(rng);
     let mut rt = RoutingTable {
         buckets: Default::default(),
