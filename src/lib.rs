@@ -76,7 +76,10 @@ use std::{
 use futures_buffered::FuturesUnordered;
 use indexmap::IndexSet;
 use iroh::NodeId;
-use irpc::channel::{mpsc, oneshot};
+use irpc::{
+    LocalSender,
+    channel::{mpsc, oneshot},
+};
 use n0_future::{BufferedStreamExt, MaybeFuture, StreamExt, stream};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::index::sample};
 use serde::{Deserialize, Serialize};
@@ -1247,9 +1250,9 @@ impl Candidates {
 struct Actor<P> {
     node: Node,
     /// receiver for rpc messages from the network
-    rpc_rx: tokio::sync::mpsc::Receiver<RpcMessage>,
+    rpc_rx: mpsc::Receiver<RpcMessage>,
     /// receiver for api messages from in process or local network
-    api_rx: tokio::sync::mpsc::Receiver<ApiMessage>,
+    api_rx: mpsc::Receiver<ApiMessage>,
     /// ongoing tasks
     tasks: JoinSet<()>,
     /// state
@@ -1404,12 +1407,12 @@ where
 {
     fn new(
         node: Node,
-        rx: tokio::sync::mpsc::Receiver<RpcMessage>,
+        rx: mpsc::Receiver<RpcMessage>,
         pool: P,
         config: Config,
     ) -> (Self, ApiClient) {
-        let (api_tx, internal_rx) = tokio::sync::mpsc::channel(32);
-        let api = ApiClient(Arc::new(api_tx.into()));
+        let (api_tx, internal_rx) = mpsc::channel(32);
+        let api = ApiClient(Arc::new(LocalSender::from(api_tx).into()));
         let mut tasks = JoinSet::new();
         let state = State {
             api: api.downgrade(),
@@ -1441,14 +1444,14 @@ where
         loop {
             tokio::select! {
                 msg = self.rpc_rx.recv() => {
-                    if let Some(msg) = msg {
+                    if let Ok(Some(msg)) = msg {
                         self.handle_rpc(msg).await;
                     } else {
                         break;
                     }
                 }
                 msg = self.api_rx.recv() => {
-                    if let Some(msg) = msg {
+                    if let Ok(Some(msg)) = msg {
                         self.handle_api(msg).await;
                     } else {
                         break;
@@ -1923,7 +1926,7 @@ fn create_node_impl<P: ClientPool>(
             node.routing_table.add_node(bootstrap_id);
         }
     }
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(32);
     let (actor, api) = Actor::<P>::new(node, rx, pool, config);
     tokio::spawn(actor.run());
     (RpcClient::new(irpc::Client::local(tx)), api)
