@@ -1173,15 +1173,11 @@ pub mod pool {
         }
 
         fn node_addr(&self, node_id: NodeId) -> NodeAddr {
-            // enrich the node id with available dialing info if available.
+            // TODO: we need to get the info from the endpoint somehow, but as 
+            // 0.93.0 it is no longer possible.
             //
-            // for ids in our routing table, we should have dialed them at some
-            // point, so we should have some info for them. If not, the
-            // receiver will have to rely on node discovery.
-            match self.endpoint.remote_info(node_id) {
-                Some(info) => info.into(),
-                None => node_id.into(),
-            }
+            // See https://github.com/n0-computer/iroh/issues/3521
+            node_id.into()
         }
 
         fn add_node_addr(&self, addr: NodeAddr) {

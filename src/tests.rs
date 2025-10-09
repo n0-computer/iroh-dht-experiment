@@ -8,7 +8,7 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, SecretKey, Watcher, discovery::static_provider::StaticProvider, endpoint::BindError,
+    Endpoint, SecretKey, discovery::static_provider::StaticProvider, endpoint::BindError,
     protocol::Router,
 };
 use iroh_blobs::util::connection_pool::ConnectionPool;
@@ -555,7 +555,7 @@ async fn iroh_create_nodes(
                     .discovery(discovery.clone())
                     .bind()
                     .await?;
-                let addr = endpoint.node_addr().initialized().await;
+                let addr = endpoint.node_addr();
                 discovery.add_node_info(addr.clone());
                 let pool = ConnectionPool::new(
                     endpoint.clone(),

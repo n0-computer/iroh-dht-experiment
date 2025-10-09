@@ -13,14 +13,14 @@ blake3 = "1.8.2"
 futures-buffered = "0.2.12"
 hex = "0.4.3"
 indexmap = "2.10.0"
-iroh = "0.92"
-iroh-base = "0.92"
-iroh-blobs = { version = "0.94.0", default-features = false }
-irpc = "0.8.0"
-irpc-iroh = "0.8.0"
+iroh = "0.93"
+iroh-base = "0.93"
+iroh-blobs = { version = "0.95.0", default-features = false }
+irpc = "0.9.0"
+irpc-iroh = "0.9.0"
 n0-future = "0.2.0"
 rand = "0.8.5"
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5.1"
 snafu = "0.8.6"
 textplots = "0.8.7"
