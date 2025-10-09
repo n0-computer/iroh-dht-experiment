@@ -386,7 +386,6 @@ pub mod api {
 
     use crate::{
         now,
-        routing::NodeInfo,
         rpc::{Blake3Immutable, Id, Kind, Value},
     };
 
@@ -421,7 +420,7 @@ pub mod api {
             n: Option<NonZeroU64>,
         },
         /// Get the routing table for testing
-        #[rpc(tx = oneshot::Sender<Vec<Vec<NodeInfo>>>)]
+        #[rpc(tx = oneshot::Sender<Vec<Vec<NodeId>>>)]
         #[wrap(GetRoutingTable)]
         GetRoutingTable,
         /// Get storage stats for testing
@@ -464,7 +463,7 @@ pub mod api {
             self.0.rpc(GetStorageStats).await
         }
 
-        pub async fn get_routing_table(&self) -> irpc::Result<Vec<Vec<NodeInfo>>> {
+        pub async fn get_routing_table(&self) -> irpc::Result<Vec<Vec<NodeId>>> {
             self.0.rpc(GetRoutingTable).await
         }
 
@@ -620,7 +619,6 @@ mod routing {
 
     use arrayvec::ArrayVec;
     use iroh::NodeId;
-    use serde::{Deserialize, Serialize};
 
     use super::rpc::Id;
 
@@ -677,21 +675,9 @@ mod routing {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-    pub struct NodeInfo {
-        pub id: NodeId,
-        pub last_seen: u64,
-    }
-
-    impl NodeInfo {
-        pub fn new(id: NodeId, last_seen: u64) -> Self {
-            Self { id, last_seen }
-        }
-    }
-
     #[derive(Debug, Clone, Default)]
     pub struct KBucket {
-        nodes: ArrayVec<NodeInfo, K>,
+        nodes: ArrayVec<NodeId, K>,
     }
 
     impl KBucket {
@@ -701,11 +687,10 @@ mod routing {
             }
         }
 
-        pub fn add_node(&mut self, node: NodeInfo) -> bool {
+        pub fn add_node(&mut self, node: NodeId) -> bool {
             // Check if node already exists and update it
             for existing in &mut self.nodes {
-                if existing.id == node.id {
-                    existing.last_seen = node.last_seen;
+                if existing == &node {
                     return true; // Updated existing node
                 }
             }
@@ -720,10 +705,10 @@ mod routing {
         }
 
         fn remove_node(&mut self, id: &NodeId) {
-            self.nodes.retain(|n| n.id != *id);
+            self.nodes.retain(|n| n != id);
         }
 
-        pub fn nodes(&self) -> &[NodeInfo] {
+        pub fn nodes(&self) -> &[NodeId] {
             &self.nodes
         }
     }
@@ -767,7 +752,7 @@ mod routing {
             let buckets = buckets
                 .map(|mut buckets| {
                     for bucket in buckets.0.iter_mut() {
-                        bucket.nodes.retain(|n| n.id != local_id);
+                        bucket.nodes.retain(|n| n != &local_id);
                     }
                     buckets
                 })
@@ -790,15 +775,15 @@ mod routing {
             self.buckets[bucket_idx]
                 .nodes()
                 .iter()
-                .any(|node| node.id == *id)
+                .any(|node| node == id)
         }
 
-        pub fn add_node(&mut self, node: NodeInfo) -> bool {
-            if node.id == self.local_id {
+        pub fn add_node(&mut self, node: NodeId) -> bool {
+            if node == self.local_id {
                 return false;
             }
 
-            let bucket_idx = self.bucket_index(node.id.as_bytes());
+            let bucket_idx = self.bucket_index(node.as_bytes());
             self.buckets[bucket_idx].add_node(node)
         }
 
@@ -807,7 +792,7 @@ mod routing {
             self.buckets[bucket_idx].remove_node(id);
         }
 
-        pub fn nodes(&self) -> impl Iterator<Item = &NodeInfo> {
+        pub fn nodes(&self) -> impl Iterator<Item = &NodeId> {
             self.buckets.iter().flat_map(|bucket| bucket.nodes())
         }
 
@@ -820,7 +805,7 @@ mod routing {
             let mut candidates = Vec::with_capacity(self.nodes().count());
             candidates.extend(
                 self.nodes()
-                    .map(|node| Distance::between(target, node.id.as_bytes())),
+                    .map(|node| Distance::between(target, node.as_bytes())),
             );
             if k < candidates.len() {
                 candidates.select_nth_unstable(k - 1);
@@ -842,7 +827,7 @@ mod routing {
 #[doc(hidden)]
 pub mod bench_exports {
     pub use crate::{
-        routing::{Buckets, KBucket, NodeInfo, RoutingTable},
+        routing::{Buckets, KBucket, RoutingTable},
         rpc::Id,
     };
 }
@@ -850,7 +835,7 @@ pub mod bench_exports {
 use crate::{
     api::{ApiMessage, Lookup, NetworkGet, NetworkPut, WeakApiClient},
     pool::ClientPool,
-    routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, NodeInfo, RoutingTable},
+    routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
     rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     u256::U256,
 };
@@ -1173,7 +1158,7 @@ pub mod pool {
         }
 
         fn node_addr(&self, node_id: NodeId) -> NodeAddr {
-            // TODO: we need to get the info from the endpoint somehow, but as 
+            // TODO: we need to get the info from the endpoint somehow, but as
             // 0.93.0 it is no longer possible.
             //
             // See https://github.com/n0-computer/iroh/issues/3521
@@ -1482,11 +1467,8 @@ where
     async fn handle_api(&mut self, message: ApiMessage) {
         match message {
             ApiMessage::NodesSeen(msg) => {
-                let now = now();
                 for id in msg.ids.iter().copied() {
-                    self.node
-                        .routing_table
-                        .add_node(NodeInfo { id, last_seen: now });
+                    self.node.routing_table.add_node(id);
                 }
             }
             ApiMessage::NodesDead(msg) => {
@@ -1691,11 +1673,7 @@ where
             return;
         }
         if self.node.routing_table.contains(&id) {
-            // we trust this node already, update the time
-            self.node.routing_table.add_node(NodeInfo {
-                id,
-                last_seen: now(),
-            });
+            return;
         }
         let Some(candidates) = &mut self.candidates else {
             // candidate tracking is not enabled
@@ -1942,10 +1920,7 @@ fn create_node_impl<P: ClientPool>(
     };
     for bootstrap_id in bootstrap {
         if bootstrap_id != id {
-            node.routing_table.add_node(NodeInfo {
-                id: bootstrap_id,
-                last_seen: now(),
-            });
+            node.routing_table.add_node(bootstrap_id);
         }
     }
     let (tx, rx) = tokio::sync::mpsc::channel(32);

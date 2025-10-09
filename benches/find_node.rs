@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use iroh_dht_experiment::bench_exports::{self, Id, NodeInfo, RoutingTable};
+use iroh_dht_experiment::bench_exports::{self, Id, RoutingTable};
 use rand::Rng;
 
 fn random_node_id(rng: &mut impl Rng) -> iroh::PublicKey {
@@ -26,10 +26,7 @@ fn create_full_rt(rng: &mut impl Rng) -> bench_exports::RoutingTable {
     };
     for i in 0..256 {
         for _j in 0..20 {
-            rt.buckets[i].add_node(NodeInfo {
-                id: random_node_id(rng),
-                last_seen: 0,
-            });
+            rt.buckets[i].add_node(random_node_id(rng));
         }
     }
 
@@ -45,11 +42,8 @@ fn create_realistic_rt(rng: &mut impl Rng, n: usize) -> bench_exports::RoutingTa
         buckets: Default::default(),
         local_id,
     };
-    for i in 0..n {
-        rt.add_node(NodeInfo {
-            id: random_node_id(rng),
-            last_seen: i as u64,
-        });
+    for _i in 0..n {
+        rt.add_node(random_node_id(rng));
     }
     rt
 }

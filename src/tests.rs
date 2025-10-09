@@ -372,10 +372,7 @@ fn create_buckets(ids: &[NodeId]) -> Box<Buckets> {
     let node_id = secret.public();
     let mut routing_table = RoutingTable::new(node_id, None);
     for id in ids {
-        routing_table.add_node(NodeInfo {
-            id: *id,
-            last_seen: now(),
-        });
+        routing_table.add_node(*id);
     }
     routing_table.buckets
 }
@@ -839,7 +836,7 @@ async fn make_frame(ids: &[NodeId], nodes: &Nodes) -> TestResult<Vec<bool>> {
         let routing_table = api.get_routing_table().await?;
         let node_ids = routing_table
             .iter()
-            .flat_map(|peers| peers.iter().map(|x| x.id))
+            .flat_map(|peers| peers.iter().map(|x| x))
             .collect::<HashSet<_>>();
         res.extend(ids.iter().map(|id| node_ids.contains(id)));
     }
@@ -903,7 +900,7 @@ async fn partition_1k() -> TestResult<()> {
             let routing_table = api.get_routing_table().await?;
             knows_last_id += routing_table
                 .iter()
-                .map(|peers| peers.iter().filter(|x| x.id == last_id).count())
+                .map(|peers| peers.iter().filter(|x| x == &&last_id).count())
                 .sum::<usize>();
         }
         frames.data.push(make_frame(&ids, &nodes).await?);
