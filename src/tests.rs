@@ -367,7 +367,7 @@ async fn plot_random_lookup_stats(prefix: &str, nodes: &Nodes, n: usize) -> irpc
 ///
 /// Note that if there are a lot of ids, they won't all fit.
 #[allow(dead_code)]
-fn create_buckets(ids: &[NodeId]) -> Box<Buckets> {
+fn create_buckets(ids: &[NodeId]) -> Buckets {
     let secret = SecretKey::from_bytes(&[0; 32]);
     let node_id = secret.public();
     let mut routing_table = RoutingTable::new(node_id, None);
@@ -531,7 +531,7 @@ type IrohNodes = Vec<(Endpoint, (RpcClient, ApiClient))>;
 async fn iroh_create_nodes(
     secrets: &[SecretKey],
     mut n_bootstrap: usize,
-    buckets: Option<Box<Buckets>>,
+    buckets: Option<Buckets>,
 ) -> std::result::Result<IrohNodes, BindError> {
     let n = secrets.len();
     let node_ids = secrets.iter().map(|s| s.public()).collect::<Vec<_>>();

@@ -684,6 +684,10 @@ mod routing {
     }
 
     impl KBucket {
+        const EMPTY: &'static Self = &Self {
+            nodes: ArrayVec::new_const(),
+        };
+
         fn new() -> Self {
             Self {
                 nodes: ArrayVec::new(),
@@ -718,12 +722,12 @@ mod routing {
 
     #[derive(Debug)]
     pub struct RoutingTable {
-        pub buckets: Box<Buckets>,
+        pub buckets: Buckets,
         pub local_id: NodeId,
     }
 
-    #[derive(Debug, Clone)]
-    pub struct Buckets(pub [KBucket; BUCKET_COUNT]);
+    #[derive(Debug, Clone, Default)]
+    pub struct Buckets(Vec<KBucket>);
 
     impl Buckets {
         pub fn iter(&self) -> std::slice::Iter<'_, KBucket> {
@@ -734,24 +738,30 @@ mod routing {
     impl Index<usize> for Buckets {
         type Output = KBucket;
         fn index(&self, index: usize) -> &Self::Output {
+            if index >= BUCKET_COUNT {
+                panic!("Bucket index out of range: {index} >= {}", self.0.len());
+            }
+            if index >= self.0.len() {
+                return &KBucket::EMPTY;
+            }
             &self.0[index]
         }
     }
 
     impl IndexMut<usize> for Buckets {
         fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+            if index >= BUCKET_COUNT {
+                panic!("Bucket index out of range: {index} >= {}", self.0.len());
+            }
+            if index >= self.0.len() {
+                self.0.resize(index + 1, KBucket::new());
+            }
             &mut self.0[index]
         }
     }
 
-    impl Default for Buckets {
-        fn default() -> Self {
-            Self(std::array::from_fn(|_| KBucket::new()))
-        }
-    }
-
     impl RoutingTable {
-        pub fn new(local_id: NodeId, buckets: Option<Box<Buckets>>) -> Self {
+        pub fn new(local_id: NodeId, buckets: Option<Buckets>) -> Self {
             let buckets = buckets
                 .map(|mut buckets| {
                     for bucket in buckets.0.iter_mut() {
@@ -763,18 +773,30 @@ mod routing {
             Self { buckets, local_id }
         }
 
-        fn bucket_index(&self, target: &[u8; 32]) -> usize {
+        /// Get the bucket index for a given target ID.
+        ///
+        /// Contrary to the normal definition, we have bucket 0 be the furthest
+        /// xor distance, and bucket 255 be the closest. This means that buckets
+        /// are filled from the start of the array.
+        ///
+        /// For randomly chosen node ids, it is astronomically unlikely that
+        /// high buckets are filled at all, even for giant DHTs.
+        ///
+        /// Returns None if the target is the same as the local ID.
+        fn bucket_index(&self, target: &[u8; 32]) -> Option<usize> {
             let distance = xor(self.local_id.as_bytes(), target);
             let zeros = leading_zeros(&distance);
             if zeros >= BUCKET_COUNT {
-                0 // Same node case
+                None
             } else {
-                BUCKET_COUNT - 1 - zeros
+                Some(zeros)
             }
         }
 
         pub(crate) fn contains(&self, id: &NodeId) -> bool {
-            let bucket_idx = self.bucket_index(id.as_bytes());
+            let Some(bucket_idx) = self.bucket_index(id.as_bytes()) else {
+                return false;
+            };
             self.buckets[bucket_idx]
                 .nodes()
                 .iter()
@@ -782,16 +804,16 @@ mod routing {
         }
 
         pub fn add_node(&mut self, node: NodeId) -> bool {
-            if node == self.local_id {
+            let Some(bucket_idx) = self.bucket_index(node.as_bytes()) else {
                 return false;
-            }
-
-            let bucket_idx = self.bucket_index(node.as_bytes());
+            };
             self.buckets[bucket_idx].add_node(node)
         }
 
         pub(crate) fn remove_node(&mut self, id: &NodeId) {
-            let bucket_idx = self.bucket_index(id.as_bytes());
+            let Some(bucket_idx) = self.bucket_index(id.as_bytes()) else {
+                return;
+            };
             self.buckets[bucket_idx].remove_node(id);
         }
 
@@ -1914,7 +1936,7 @@ fn create_node_impl<P: ClientPool>(
     id: NodeId,
     pool: P,
     bootstrap: Vec<NodeId>,
-    buckets: Option<Box<Buckets>>,
+    buckets: Option<Buckets>,
     config: Config,
 ) -> (RpcClient, ApiClient) {
     let mut node = Node {
