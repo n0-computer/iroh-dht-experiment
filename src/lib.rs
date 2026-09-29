@@ -122,8 +122,8 @@ pub mod rpc {
     /// hashes instead of SHA-1 hashes.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Blake3Provider {
-        timestamp: u64, // Unix timestamp for expiry
-        node_id: [u8; 32],
+        pub timestamp: u64, // Unix timestamp for expiry
+        pub node_id: [u8; 32],
     }
 
     /// Small immutable value.
@@ -389,7 +389,7 @@ pub mod api {
 
     use crate::{
         now,
-        rpc::{Blake3Immutable, Id, Kind, Value},
+        rpc::{Blake3Immutable, Blake3Provider, Id, Kind, Value},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -531,6 +531,53 @@ pub mod api {
                     }
                 }
             }
+        }
+
+        pub async fn put_provider(
+            &self,
+            hash: blake3::Hash,
+            node_id: NodeId,
+        ) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkPut {
+                        id: Id::from(*hash.as_bytes()),
+                        value: Value::Blake3Provider(Blake3Provider {
+                            timestamp: now(),
+                            node_id: *node_id.as_bytes(),
+                        }),
+                    },
+                    32,
+                )
+                .await?;
+            let mut stored = Vec::new();
+            while let Ok(Some(id)) = rx.recv().await {
+                stored.push(id);
+            }
+            Ok(stored)
+        }
+
+        pub async fn get_providers(&self, hash: blake3::Hash) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkGet {
+                        id: Id::from(*hash.as_bytes()),
+                        kind: Kind::Blake3Provider,
+                        seed: None,
+                        n: None,
+                    },
+                    32,
+                )
+                .await?;
+            let mut providers = Vec::new();
+            while let Ok(Some((_, Value::Blake3Provider(provider)))) = rx.recv().await {
+                if let Ok(id) = NodeId::from_bytes(&provider.node_id) {
+                    providers.push(id);
+                }
+            }
+            Ok(providers)
         }
 
         pub async fn put_immutable(
