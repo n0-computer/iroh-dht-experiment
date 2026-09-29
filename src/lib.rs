@@ -122,8 +122,8 @@ pub mod rpc {
     /// hashes instead of SHA-1 hashes.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Blake3Provider {
-        timestamp: u64, // Unix timestamp for expiry
-        node_id: [u8; 32],
+        pub(crate) timestamp: u64, // Unix timestamp for expiry
+        pub(crate) node_id: [u8; 32],
     }
 
     /// Small immutable value.
@@ -389,7 +389,7 @@ pub mod api {
 
     use crate::{
         now,
-        rpc::{Blake3Immutable, Id, Kind, Value},
+        rpc::{Blake3Immutable, Blake3Provider, Id, Kind, Value},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -414,6 +414,13 @@ pub mod api {
         #[rpc(tx = mpsc::Sender<NodeId>)]
         #[wrap(NetworkPut)]
         NetworkPut { id: Id, value: Value },
+        #[rpc(tx = mpsc::Sender<NodeId>)]
+        #[wrap(NetworkPutAt)]
+        NetworkPutAt {
+            ids: Vec<NodeId>,
+            id: Id,
+            value: Value,
+        },
         #[rpc(tx = mpsc::Sender<(NodeId, Value)>)]
         #[wrap(NetworkGet)]
         NetworkGet {
@@ -531,6 +538,33 @@ pub mod api {
                     }
                 }
             }
+        }
+
+        pub async fn put_provider_at(
+            &self,
+            hash: blake3::Hash,
+            node_id: NodeId,
+            nodes: &[NodeId],
+        ) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkPutAt {
+                        ids: nodes.to_vec(),
+                        id: Id::from(*hash.as_bytes()),
+                        value: Value::Blake3Provider(Blake3Provider {
+                            timestamp: now(),
+                            node_id: *node_id.as_bytes(),
+                        }),
+                    },
+                    32,
+                )
+                .await?;
+            let mut stored = Vec::new();
+            while let Ok(Some(id)) = rx.recv().await {
+                stored.push(id);
+            }
+            Ok(stored)
         }
 
         pub async fn put_immutable(
@@ -879,10 +913,10 @@ pub mod bench_exports {
 }
 
 use crate::{
-    api::{ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, WeakApiClient},
+    api::{ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, NetworkPutAt, WeakApiClient},
     pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
-    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
+    rpc::{Blake3Provider, Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     u256::U256,
 };
 
@@ -1448,6 +1482,11 @@ impl Config {
         self
     }
 
+    pub fn parallelism(mut self, value: usize) -> Self {
+        self.parallelism = value;
+        self
+    }
+
     pub fn query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
         self
@@ -1581,6 +1620,13 @@ where
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
                 self.tasks
                     .spawn(self.state.clone().network_put(initial, msg.inner, msg.tx));
+            }
+            ApiMessage::NetworkPutAt(msg) => {
+                self.tasks.spawn(self.state.clone().network_put_at(
+                    msg.inner.ids.clone(),
+                    msg.inner,
+                    msg.tx,
+                ));
             }
             ApiMessage::GetRoutingTable(msg) => {
                 let table = self
@@ -1808,6 +1854,24 @@ impl<P: ClientPool> State<P> {
                         tx.send(id).await.ok();
                     }
                     drop(client);
+                }
+            })
+            .await;
+    }
+
+    async fn network_put_at(self, ids: Vec<NodeId>, msg: NetworkPutAt, tx: mpsc::Sender<NodeId>) {
+        stream::iter(ids)
+            .for_each_concurrent(self.config.parallelism, |id| {
+                let pool = self.pool.clone();
+                let value = msg.value.clone();
+                let tx = tx.clone();
+                async move {
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    if let Ok(SetResponse::Ok) = client.set(msg.id, value).await {
+                        tx.send(id).await.ok();
+                    }
                 }
             })
             .await;
