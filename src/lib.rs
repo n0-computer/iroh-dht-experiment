@@ -80,10 +80,10 @@ use irpc::{
     LocalSender,
     channel::{mpsc, oneshot},
 };
+use n0_future::task::JoinSet;
 use n0_future::{BufferedStreamExt, MaybeFuture, StreamExt, stream};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::index::sample};
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
 #[cfg(test)]
 mod tests;
 pub mod rpc {
@@ -122,8 +122,8 @@ pub mod rpc {
     /// hashes instead of SHA-1 hashes.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Blake3Provider {
-        timestamp: u64, // Unix timestamp for expiry
-        node_id: [u8; 32],
+        pub timestamp: u64, // Unix timestamp for expiry
+        pub node_id: [u8; 32],
     }
 
     /// Small immutable value.
@@ -334,6 +334,11 @@ pub mod rpc {
             Self(Arc::new(client))
         }
 
+        /// Creates the inbound iroh protocol handler for this RPC client.
+        pub fn protocol(&self) -> irpc_iroh::IrohProtocol<RpcProto> {
+            irpc_iroh::IrohProtocol::with_sender(self.0.as_local().unwrap())
+        }
+
         pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
             self.0.rpc(Set { key, value }).await
         }
@@ -389,7 +394,7 @@ pub mod api {
 
     use crate::{
         now,
-        rpc::{Blake3Immutable, Id, Kind, Value},
+        rpc::{Blake3Immutable, Blake3Provider, Id, Kind, Value},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -414,6 +419,16 @@ pub mod api {
         #[rpc(tx = mpsc::Sender<NodeId>)]
         #[wrap(NetworkPut)]
         NetworkPut { id: Id, value: Value },
+        #[rpc(tx = mpsc::Sender<NodeId>)]
+        #[wrap(NetworkPutAt)]
+        NetworkPutAt {
+            ids: Vec<NodeId>,
+            id: Id,
+            value: Value,
+        },
+        #[rpc(tx = mpsc::Sender<NodeId>)]
+        #[wrap(PublishProviders)]
+        PublishProviders { id: Id, providers: Vec<NodeId> },
         #[rpc(tx = mpsc::Sender<(NodeId, Value)>)]
         #[wrap(NetworkGet)]
         NetworkGet {
@@ -533,6 +548,94 @@ pub mod api {
             }
         }
 
+        pub async fn put_provider(
+            &self,
+            hash: blake3::Hash,
+            node_id: NodeId,
+        ) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkPut {
+                        id: Id::from(*hash.as_bytes()),
+                        value: Value::Blake3Provider(Blake3Provider {
+                            timestamp: now(),
+                            node_id: *node_id.as_bytes(),
+                        }),
+                    },
+                    32,
+                )
+                .await?;
+            let mut stored = Vec::new();
+            while let Ok(Some(id)) = rx.recv().await {
+                stored.push(id);
+            }
+            Ok(stored)
+        }
+        pub async fn put_provider_at(
+            &self,
+            hash: blake3::Hash,
+            node_id: NodeId,
+            nodes: &[NodeId],
+        ) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkPutAt {
+                        ids: nodes.to_vec(),
+                        id: Id::from(*hash.as_bytes()),
+                        value: Value::Blake3Provider(Blake3Provider {
+                            timestamp: now(),
+                            node_id: *node_id.as_bytes(),
+                        }),
+                    },
+                    32,
+                )
+                .await?;
+            let mut stored = Vec::new();
+            while let Ok(Some(id)) = rx.recv().await {
+                stored.push(id);
+            }
+            Ok(stored)
+        }
+
+        pub async fn get_providers(&self, hash: blake3::Hash) -> irpc::Result<Vec<NodeId>> {
+            let mut rx = self
+                .0
+                .server_streaming(
+                    NetworkGet {
+                        id: Id::from(*hash.as_bytes()),
+                        kind: Kind::Blake3Provider,
+                        seed: None,
+                        n: None,
+                    },
+                    32,
+                )
+                .await?;
+            let mut providers = Vec::new();
+            while let Ok(Some((_, Value::Blake3Provider(provider)))) = rx.recv().await {
+                if let Ok(id) = NodeId::from_bytes(&provider.node_id) {
+                    providers.push(id);
+                }
+            }
+            Ok(providers)
+        }
+        /// Starts provider replication and streams successful storage nodes.
+        pub async fn publish_providers(
+            &self,
+            hash: blake3::Hash,
+            providers: &[NodeId],
+        ) -> irpc::Result<irpc::channel::mpsc::Receiver<NodeId>> {
+            self.0
+                .server_streaming(
+                    PublishProviders {
+                        id: Id::from(*hash.as_bytes()),
+                        providers: providers.to_vec(),
+                    },
+                    32,
+                )
+                .await
+        }
         pub async fn put_immutable(
             &self,
             value: &[u8],
@@ -633,6 +736,9 @@ pub mod api {
     }
 }
 pub use api::ApiClient;
+
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 use tracing::{error, info, warn};
 
 mod routing {
@@ -879,10 +985,13 @@ pub mod bench_exports {
 }
 
 use crate::{
-    api::{ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, WeakApiClient},
+    api::{
+        ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, NetworkPutAt, PublishProviders,
+        WeakApiClient,
+    },
     pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
-    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
+    rpc::{Blake3Provider, Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     u256::U256,
 };
 
@@ -1448,6 +1557,11 @@ impl Config {
         self
     }
 
+    pub fn parallelism(mut self, value: usize) -> Self {
+        self.parallelism = value;
+        self
+    }
+
     pub fn query_timeout(mut self, timeout: Duration) -> Self {
         self.query_timeout = Some(timeout);
         self
@@ -1490,6 +1604,7 @@ where
             pool,
             config: config.clone(),
         };
+        #[cfg(not(target_arch = "wasm32"))]
         tasks.spawn(state.clone().notify_self());
         (
             Self {
@@ -1581,6 +1696,21 @@ where
                 let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
                 self.tasks
                     .spawn(self.state.clone().network_put(initial, msg.inner, msg.tx));
+            }
+            ApiMessage::NetworkPutAt(msg) => {
+                self.tasks.spawn(self.state.clone().network_put_at(
+                    msg.inner.ids.clone(),
+                    msg.inner,
+                    msg.tx,
+                ));
+            }
+            ApiMessage::PublishProviders(msg) => {
+                let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
+                self.tasks.spawn(
+                    self.state
+                        .clone()
+                        .publish_providers(initial, msg.inner, msg.tx),
+                );
             }
             ApiMessage::GetRoutingTable(msg) => {
                 let table = self
@@ -1813,6 +1943,24 @@ impl<P: ClientPool> State<P> {
             .await;
     }
 
+    async fn network_put_at(self, ids: Vec<NodeId>, msg: NetworkPutAt, tx: mpsc::Sender<NodeId>) {
+        stream::iter(ids)
+            .for_each_concurrent(self.config.parallelism, |id| {
+                let pool = self.pool.clone();
+                let value = msg.value.clone();
+                let tx = tx.clone();
+                async move {
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    if let Ok(SetResponse::Ok) = client.set(msg.id, value).await {
+                        tx.send(id).await.ok();
+                    }
+                }
+            })
+            .await;
+    }
+
     async fn network_get(
         self,
         initial: Vec<NodeId>,
@@ -1844,6 +1992,42 @@ impl<P: ClientPool> State<P> {
                         }
                     }
                     drop(client);
+                }
+            })
+            .await;
+    }
+
+    async fn publish_providers(
+        self,
+        initial: Vec<NodeId>,
+        msg: PublishProviders,
+        tx: mpsc::Sender<NodeId>,
+    ) {
+        let ids = self.clone().iterative_find_node(msg.id, initial).await;
+        let values = msg
+            .providers
+            .into_iter()
+            .map(|node_id| {
+                Value::Blake3Provider(Blake3Provider {
+                    timestamp: now(),
+                    node_id: *node_id.as_bytes(),
+                })
+            })
+            .collect::<Vec<_>>();
+        stream::iter(ids)
+            .for_each_concurrent(self.config.parallelism, |id| {
+                let pool = self.pool.clone();
+                let values = values.clone();
+                let tx = tx.clone();
+                async move {
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    for value in values {
+                        if let Ok(SetResponse::Ok) = client.set(msg.id, value).await {
+                            tx.send(id).await.ok();
+                        }
+                    }
                 }
             })
             .await;
@@ -2073,16 +2257,13 @@ impl<P: ClientPool> State<P> {
             let api = self.api.clone();
             candidate_lookup = MaybeFuture::Some(api.candidate_lookup_periodic(strategy.interval));
         }
-        tokio::pin!(self_lookup, random_lookup, candidate_lookup);
+        n0_future::pin!(self_lookup, random_lookup, candidate_lookup);
         loop {
-            tokio::select! {
-                _ = &mut self_lookup => {
-                }
-                _ = &mut random_lookup => {
-                }
-                _ = &mut candidate_lookup => {
-                }
-            }
+            n0_future::future::race(
+                n0_future::future::race(&mut self_lookup, &mut random_lookup),
+                &mut candidate_lookup,
+            )
+            .await;
         }
     }
 }
@@ -2105,8 +2286,14 @@ fn blend(a: U256, b: U256, n: u32) -> U256 {
     a & a_mask | a ^ xor_mask | b & b_mask
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
 }
 
 /// Creates a DHT node
@@ -2138,6 +2325,6 @@ fn create_node_impl<P: ClientPool>(
     }
     let (tx, rx) = mpsc::channel(32);
     let (actor, api) = Actor::<P>::new(node, rx, pool, config);
-    tokio::spawn(actor.run());
+    n0_future::task::spawn(actor.run());
     (RpcClient::new(irpc::Client::local(tx)), api)
 }
