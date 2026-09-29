@@ -122,8 +122,8 @@ pub mod rpc {
     /// hashes instead of SHA-1 hashes.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Blake3Provider {
-        timestamp: u64, // Unix timestamp for expiry
-        node_id: [u8; 32],
+        pub(crate) timestamp: u64, // Unix timestamp for expiry
+        pub(crate) node_id: [u8; 32],
     }
 
     /// Small immutable value.
@@ -414,6 +414,9 @@ pub mod api {
         #[rpc(tx = mpsc::Sender<NodeId>)]
         #[wrap(NetworkPut)]
         NetworkPut { id: Id, value: Value },
+        #[rpc(tx = mpsc::Sender<NodeId>)]
+        #[wrap(PublishProviders)]
+        PublishProviders { id: Id, providers: Vec<NodeId> },
         #[rpc(tx = mpsc::Sender<(NodeId, Value)>)]
         #[wrap(NetworkGet)]
         NetworkGet {
@@ -879,10 +882,12 @@ pub mod bench_exports {
 }
 
 use crate::{
-    api::{ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, WeakApiClient},
+    api::{
+        ApiMessage, Lookup, LookupStream, NetworkGet, NetworkPut, PublishProviders, WeakApiClient,
+    },
     pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
-    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
+    rpc::{Blake3Provider, Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
     u256::U256,
 };
 
@@ -1582,6 +1587,14 @@ where
                 self.tasks
                     .spawn(self.state.clone().network_put(initial, msg.inner, msg.tx));
             }
+            ApiMessage::PublishProviders(msg) => {
+                let initial = self.node.routing_table.find_closest_nodes(&msg.id, K);
+                self.tasks.spawn(
+                    self.state
+                        .clone()
+                        .publish_providers(initial, msg.inner, msg.tx),
+                );
+            }
             ApiMessage::GetRoutingTable(msg) => {
                 let table = self
                     .node
@@ -1844,6 +1857,42 @@ impl<P: ClientPool> State<P> {
                         }
                     }
                     drop(client);
+                }
+            })
+            .await;
+    }
+
+    async fn publish_providers(
+        self,
+        initial: Vec<NodeId>,
+        msg: PublishProviders,
+        tx: mpsc::Sender<NodeId>,
+    ) {
+        let ids = self.clone().iterative_find_node(msg.id, initial).await;
+        let values = msg
+            .providers
+            .into_iter()
+            .map(|node_id| {
+                Value::Blake3Provider(Blake3Provider {
+                    timestamp: now(),
+                    node_id: *node_id.as_bytes(),
+                })
+            })
+            .collect::<Vec<_>>();
+        stream::iter(ids)
+            .for_each_concurrent(self.config.parallelism, |id| {
+                let pool = self.pool.clone();
+                let values = values.clone();
+                let tx = tx.clone();
+                async move {
+                    let Ok(client) = pool.client(id).await else {
+                        return;
+                    };
+                    for value in values {
+                        if let Ok(SetResponse::Ok) = client.set(msg.id, value).await {
+                            tx.send(id).await.ok();
+                        }
+                    }
                 }
             })
             .await;
