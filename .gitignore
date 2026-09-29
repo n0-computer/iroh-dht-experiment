@@ -1,3 +1,4 @@
 /target
 *.gif
 /img/*
+/web/wasm/

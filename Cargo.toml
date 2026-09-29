@@ -7,24 +7,42 @@ keywords = ["dht", "content-discovery", "blake3"]
 description = "Experimental DHT for iroh"
 tags = ["iroh", "dht", "p2p"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 arrayvec = "0.7.6"
 blake3 = "1.8.2"
 futures-buffered = "0.2.12"
 hex = "0.4.3"
 indexmap = "2.10.0"
-iroh = "1.0"
+iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
 iroh-base = "1.0"
-iroh-blobs = { version = "0.103.0", default-features = false, features = ["rpc"] }
+iroh-blobs = { version = "0.103.0", default-features = false }
 irpc = "0.17.0"
 irpc-iroh = "0.17.0"
 n0-future = "0.2.0"
 rand = "0.8.5"
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5.1"
 snafu = "0.8.6"
-tokio = "1.47.1"
+tokio = { version = "1.47.1", default-features = false, features = ["io-util", "macros", "rt", "sync", "time"] }
 tracing = "0.1.41"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.47.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3.3", features = ["wasm_js"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1.7"
+js-sys = "0.3"
+
+# https://github.com/n0-computer/iroh-blobs/pull/264
+[patch.crates-io]
+iroh-blobs = { git = "https://github.com/bitbloxhub/iroh-blobs", branch = "push-knyzvxyutrsr" }
 
 [dev-dependencies]
 criterion = "0.7.0"

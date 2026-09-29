@@ -80,10 +80,10 @@ use irpc::{
     LocalSender,
     channel::{mpsc, oneshot},
 };
+use n0_future::task::JoinSet;
 use n0_future::{BufferedStreamExt, MaybeFuture, StreamExt, stream};
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::index::sample};
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
 #[cfg(test)]
 mod tests;
 pub mod rpc {
@@ -1490,6 +1490,7 @@ where
             pool,
             config: config.clone(),
         };
+        #[cfg(not(target_arch = "wasm32"))]
         tasks.spawn(state.clone().notify_self());
         (
             Self {
@@ -2073,16 +2074,13 @@ impl<P: ClientPool> State<P> {
             let api = self.api.clone();
             candidate_lookup = MaybeFuture::Some(api.candidate_lookup_periodic(strategy.interval));
         }
-        tokio::pin!(self_lookup, random_lookup, candidate_lookup);
+        n0_future::pin!(self_lookup, random_lookup, candidate_lookup);
         loop {
-            tokio::select! {
-                _ = &mut self_lookup => {
-                }
-                _ = &mut random_lookup => {
-                }
-                _ = &mut candidate_lookup => {
-                }
-            }
+            n0_future::future::race(
+                n0_future::future::race(&mut self_lookup, &mut random_lookup),
+                &mut candidate_lookup,
+            )
+            .await;
         }
     }
 }
@@ -2105,8 +2103,14 @@ fn blend(a: U256, b: U256, n: u32) -> U256 {
     a & a_mask | a ^ xor_mask | b & b_mask
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn now() -> u64 {
     UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
 }
 
 /// Creates a DHT node
@@ -2138,6 +2142,6 @@ fn create_node_impl<P: ClientPool>(
     }
     let (tx, rx) = mpsc::channel(32);
     let (actor, api) = Actor::<P>::new(node, rx, pool, config);
-    tokio::spawn(actor.run());
+    n0_future::task::spawn(actor.run());
     (RpcClient::new(irpc::Client::local(tx)), api)
 }
