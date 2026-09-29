@@ -334,6 +334,11 @@ pub mod rpc {
             Self(Arc::new(client))
         }
 
+        /// Creates the inbound iroh protocol handler for this RPC client.
+        pub fn protocol(&self) -> irpc_iroh::IrohProtocol<RpcProto> {
+            irpc_iroh::IrohProtocol::with_sender(self.0.as_local().unwrap())
+        }
+
         pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
             self.0.rpc(Set { key, value }).await
         }
